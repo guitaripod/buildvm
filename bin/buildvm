@@ -1,0 +1,319 @@
+#!/bin/bash
+set -euo pipefail
+
+### buildvm — build & upload iOS App Store releases from a stable-macOS VM, headless over SSH.
+###
+### WHY: when the host Mac runs a BETA macOS, any App Store binary archived on it carries a
+### beta BuildMachineOSBuild in Info.plist and Apple rejects it with ITMS-90111 — even with a
+### fully release Xcode/SDK. buildvm runs the archive inside a stable-macOS Tart guest, so the
+### artifact is stamped with a stable host-OS build number and ITMS-90111 is impossible.
+### Agent-native: every step is a non-interactive command that self-verifies and fails closed.
+###
+### Config: exported env vars, or a file at $BUILDVM_CONFIG (default ~/.config/buildvm/config.env).
+### See config.example.env. No secrets live in this repo.
+###
+### Commands:
+###   buildvm up | down | ip | status | ssh [cmd]
+###   buildvm provision                 one-time: Xcode + iOS platform + signing identity + tools
+###   buildvm snapshot [name]           stop + clone the provisioned VM as a reusable base
+###   buildvm build --dir D --scheme S --profile F... --build N [options]
+###
+### buildvm build options:
+###   --dir DIR                 project directory (rsynced to the guest)
+###   --scheme SCHEME           xcodebuild scheme
+###   --profile FILE            provisioning profile; repeat once per target (app + each
+###                             extension). Bundle-id + profile name are auto-derived. FILE is
+###                             a path or a name resolved against $BUILDVM_SIGNING_DIR.
+###   --build N                 CFBundleVersion (CURRENT_PROJECT_VERSION)
+###   --marketing V             CFBundleShortVersionString (MARKETING_VERSION); optional
+###   --env KEY=VAL             repeatable; exported before xcodegen for ${VAR} substitution
+###   --component NAME          repeatable Xcode component to ensure (e.g. MetalToolchain)
+###   --deploy-key FILE         SSH key for private SPM deps (cloned over git@github.com)
+###   --prebuild SCRIPT         local script run in the project dir on the guest before archive
+###                             (Secrets generation, etc.)
+###   --archive-flags "..."     extra xcodebuild archive flags
+###   --unsigned-archive        archive with CODE_SIGNING_ALLOWED=NO (only for projects lacking
+###                             valid per-target signing config; then the profile is the sole
+###                             entitlement source)
+###   --no-upload               build + verify but skip altool upload
+
+# ---- config -----------------------------------------------------------------
+BUILDVM_CONFIG=${BUILDVM_CONFIG:-$HOME/.config/buildvm/config.env}
+[ -f "$BUILDVM_CONFIG" ] && source "$BUILDVM_CONFIG"
+
+TART=${BUILDVM_TART:-$(command -v tart || echo "$HOME/.local/bin/tart")}
+VM=${BUILDVM_NAME:-buildvm}
+GUEST_USER=${BUILDVM_USER:-admin}
+GUEST_PASS=${BUILDVM_PASS:-admin}
+BASE_IMAGE=${BUILDVM_BASE:-ghcr.io/cirruslabs/macos-tahoe-base:latest}
+SSH_PUBKEY=${BUILDVM_SSH_PUBKEY:-$HOME/.ssh/id_ed25519.pub}
+SIGNING_DIR=${BUILDVM_SIGNING_DIR:-}
+DIST_P12=${BUILDVM_DIST_P12:-}
+DIST_P12_PASSWORD=${BUILDVM_DIST_P12_PASSWORD:-}
+DIST_P12_PASSWORD_FILE=${BUILDVM_DIST_P12_PASSWORD_FILE:-}
+SIGNING_IDENTITY=${BUILDVM_SIGNING_IDENTITY:-Apple Distribution}
+TEAM_ID=${BUILDVM_TEAM:-}
+ASC_KEY_ID=${BUILDVM_ASC_KEY_ID:-}
+ASC_ISSUER_ID=${BUILDVM_ASC_ISSUER_ID:-}
+ASC_KEY_P8=${BUILDVM_ASC_KEY_P8:-}
+
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+
+die() { echo "buildvm: $*" >&2; exit 1; }
+need() { [ -n "${!1:-}" ] || die "config $1 is required (set it in $BUILDVM_CONFIG or the environment)"; }
+vm_ip() { "$TART" ip "$VM" 2>/dev/null; }
+gssh() { local ip; ip=$(vm_ip) || die "VM not running"; ssh "${SSH_OPTS[@]}" "$GUEST_USER@$ip" "$@"; }
+gscp() { scp "${SSH_OPTS[@]}" "$@"; }
+p12_password() { [ -n "$DIST_P12_PASSWORD_FILE" ] && cat "$DIST_P12_PASSWORD_FILE" || printf '%s' "$DIST_P12_PASSWORD"; }
+
+### A macOS build number is a beta if it ends digits+letter+5xx…+lowercase, e.g. 26A5353q.
+is_beta_build() { [[ "$1" =~ [A-Z]5[0-9]{2,}[a-z]$ ]]; }
+
+resolve_profile() {
+  local p=$1
+  if [ -f "$p" ]; then echo "$p"; return; fi
+  if [ -n "$SIGNING_DIR" ] && [ -f "$SIGNING_DIR/$p" ]; then echo "$SIGNING_DIR/$p"; return; fi
+  die "no such --profile: $p"
+}
+
+cmd_up() {
+  need TART
+  if ! vm_ip >/dev/null 2>&1; then
+    nohup "$TART" run "$VM" --no-graphics >/tmp/buildvm-run.log 2>&1 &
+  fi
+  local ip
+  for _ in $(seq 1 90); do
+    if ip=$(vm_ip) && ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 -o BatchMode=yes "$GUEST_USER@$ip" true 2>/dev/null; then
+      echo "$ip"; return 0
+    fi
+    sleep 2
+  done
+  die "VM did not become reachable (is the key installed? run 'buildvm provision')"
+}
+
+cmd_down() { "$TART" stop "$VM" 2>/dev/null || true; }
+
+cmd_status() {
+  "$TART" list 2>/dev/null | grep -E "Name|$VM" || true
+  local ip
+  if ip=$(vm_ip) && ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 -o BatchMode=yes "$GUEST_USER@$ip" true 2>/dev/null; then
+    echo "ip: $ip"
+    gssh 'echo "os: $(sw_vers -productVersion) ($(sw_vers -buildVersion))"; xcodebuild -version 2>/dev/null | tr "\n" " "; echo; echo "valid identities: $(security find-identity -v -p codesigning login.keychain-db 2>/dev/null | grep -c valid)"' 2>/dev/null
+  else
+    echo "(stopped — run 'buildvm up')"
+  fi
+}
+
+install_key() {
+  local ip=$1 pub; pub=$(cat "$SSH_PUBKEY")
+  local remote="mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\n' '$pub' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+  local b64; b64=$(printf '%s' "$remote" | base64)
+  /usr/bin/expect <<EOF >/dev/null
+set timeout 30
+spawn ssh ${SSH_OPTS[*]} $GUEST_USER@$ip "echo $b64 | base64 -d | bash"
+expect { -re "(P|p)assword:" { send "$GUEST_PASS\r"; exp_continue } eof }
+EOF
+}
+
+cmd_provision() {
+  need TART; need DIST_P12; need ASC_KEY_ID; need ASC_KEY_P8
+  [ -f "$SSH_PUBKEY" ] || die "no SSH public key at $SSH_PUBKEY (set BUILDVM_SSH_PUBKEY)"
+  vm_ip >/dev/null 2>&1 || { nohup "$TART" run "$VM" --no-graphics >/tmp/buildvm-run.log 2>&1 & }
+  local ip
+  for _ in $(seq 1 90); do ip=$(vm_ip) && [ -n "$ip" ] && break; sleep 2; done
+  [ -n "${ip:-}" ] || die "VM has no IP"
+  echo "guest ip: $ip — installing SSH key"
+  install_key "$ip"
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$GUEST_USER@$ip" 'echo keyed-login-ok' || die "keyed login failed"
+
+  local build; build=$(gssh 'sw_vers -buildVersion')
+  is_beta_build "$build" && die "guest macOS $build looks like a BETA — refuse to provision"
+  echo "guest build $build (stable) ✔"
+
+  if ! gssh 'test -d /Applications/Xcode.app'; then
+    echo "== copying host Xcode.app into guest ($(du -sh /Applications/Xcode.app | cut -f1))"
+    rsync -a -e "ssh ${SSH_OPTS[*]}" /Applications/Xcode.app "$GUEST_USER@$ip:/tmp/"
+    gssh 'mv /tmp/Xcode.app /Applications/ && sudo -n xcode-select -s /Applications/Xcode.app && sudo -n xcodebuild -license accept && sudo -n xcodebuild -runFirstLaunch'
+  fi
+
+  echo "== xcodegen (many projects generate the .xcodeproj from project.yml)"
+  gssh 'test -x /usr/local/bin/xcodegen || (cd /tmp && curl -sL -o xg.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip && unzip -oq xg.zip && cd xcodegen && sudo -n bash install.sh /usr/local >/dev/null 2>&1); /usr/local/bin/xcodegen --version 2>&1 | head -1'
+
+  echo "== iOS platform (registers the generic/platform=iOS destination)"
+  gssh 'xcodebuild -showsdks 2>/dev/null | grep -qi "iOS " || xcodebuild -downloadPlatform iOS 2>&1 | tail -1'
+
+  echo "== signing identity + Apple WWDR chain + ASC key"
+  local pw; pw=$(p12_password)
+  gscp "$DIST_P12" "$ASC_KEY_P8" "$GUEST_USER@$ip:/tmp/"
+  local p12name; p12name=$(basename "$DIST_P12")
+  local p8name; p8name=$(basename "$ASC_KEY_P8")
+  gssh "security unlock-keychain -p $GUEST_PASS login.keychain-db &&
+        security import /tmp/$p12name -k login.keychain-db -P '$pw' -T /usr/bin/codesign -T /usr/bin/xcodebuild 2>&1 | tail -1 &&
+        security set-key-partition-list -S apple-tool:,apple: -s -k $GUEST_PASS login.keychain-db >/dev/null 2>&1 &&
+        cd /tmp &&
+        curl -sL -o w3.cer https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer &&
+        curl -sL -o w6.cer https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer &&
+        curl -sL -o root.cer https://www.apple.com/appleca/AppleIncRootCertificate.cer &&
+        for c in w3 w6 root; do security import \$c.cer -k login.keychain-db >/dev/null 2>&1 || true; done &&
+        mkdir -p ~/.appstoreconnect/private_keys && cp /tmp/$p8name ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8 &&
+        rm -f /tmp/$p12name /tmp/$p8name /tmp/*.cer"
+  echo "== provisioned:"
+  cmd_status
+  echo "TIP: run 'buildvm snapshot' to preserve this state as a reusable base."
+}
+
+cmd_snapshot() {
+  local name=${1:-${VM}-provisioned}
+  cmd_down
+  "$TART" clone "$VM" "$name"
+  echo "snapshot: $name"
+}
+
+cmd_build() {
+  local dir="" scheme="" marketing="" build_number=""
+  local prebuild="" deploy_key="" upload=1 archive_flags="" unsigned_archive=0
+  local -a profiles=() components=() envs=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dir) dir=$2; shift 2;;
+      --scheme) scheme=$2; shift 2;;
+      --profile) profiles+=("$2"); shift 2;;
+      --component) components+=("$2"); shift 2;;
+      --env) envs+=("$2"); shift 2;;
+      --marketing) marketing=$2; shift 2;;
+      --build) build_number=$2; shift 2;;
+      --prebuild) prebuild=$2; shift 2;;
+      --deploy-key) deploy_key=$2; shift 2;;
+      --archive-flags) archive_flags=$2; shift 2;;
+      --unsigned-archive) unsigned_archive=1; shift;;
+      --upload) upload=1; shift;;
+      --no-upload) upload=0; shift;;
+      *) die "unknown build arg: $1";;
+    esac
+  done
+  [ -d "$dir" ] || die "no such --dir: $dir"
+  [ -n "$scheme" ] && [ -n "$build_number" ] || die "need --scheme --build"
+  [ ${#profiles[@]} -gt 0 ] || die "need at least one --profile"
+  need TEAM_ID
+  [ "$upload" = 1 ] && { need ASC_KEY_ID; need ASC_ISSUER_ID; }
+
+  # Resolve each profile to an absolute path and derive (bundle-id, name) from its entitlements.
+  local -a pfiles=() pmap=()
+  local p pf appid bid pname
+  for p in "${profiles[@]}"; do
+    pf=$(resolve_profile "$p")
+    appid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract Entitlements.application-identifier raw -o - -)
+    bid=${appid#*.}                                        # strip TEAMID. prefix
+    pname=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract Name raw -o - -)
+    pfiles+=("$pf"); pmap+=("$bid=$pname")
+  done
+
+  local ip; ip=$(cmd_up)
+  local name; name=$(basename "$dir")
+  local guest_build; guest_build=$(gssh 'sw_vers -buildVersion')
+  is_beta_build "$guest_build" && die "guest macOS $guest_build is BETA — would trip ITMS-90111"
+  echo "== guest build $guest_build (stable)"
+
+  local comp
+  for comp in "${components[@]}"; do
+    echo "== ensuring component $comp"
+    gssh "xcodebuild -downloadComponent $comp 2>&1 | tail -1" || true
+  done
+
+  if [ -n "$deploy_key" ]; then
+    echo "== installing SPM deploy key"
+    gscp "$deploy_key" "$GUEST_USER@$ip:/tmp/spm_key"
+    gssh 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && mv /tmp/spm_key ~/.ssh/spm_key && chmod 600 ~/.ssh/spm_key &&
+          printf "Host github.com\n  IdentityFile ~/.ssh/spm_key\n  IdentitiesOnly yes\n" > ~/.ssh/config &&
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null'
+  fi
+
+  echo "== syncing $name → guest"
+  gssh 'mkdir -p ~/builds'
+  rsync -a --delete --exclude .git --exclude DerivedData --exclude build --exclude '*.xcuserstate' \
+    -e "ssh ${SSH_OPTS[*]}" "$dir/" "$GUEST_USER@$ip:builds/$name/"
+
+  if [ -n "$prebuild" ]; then
+    echo "== prebuild"
+    gscp "$prebuild" "$GUEST_USER@$ip:/tmp/prebuild.sh"
+    gssh "cd builds/$name && bash /tmp/prebuild.sh"
+  fi
+
+  echo "== installing ${#pfiles[@]} profile(s)"
+  gssh "mkdir -p ~/Library/Developer/Xcode/UserData/Provisioning\\ Profiles ~/Library/MobileDevice/Provisioning\\ Profiles"
+  for pf in "${pfiles[@]}"; do
+    local uuid; uuid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract UUID raw -o - -)
+    gscp "$pf" "$GUEST_USER@$ip:/tmp/$uuid.mobileprovision"
+    gssh "cp /tmp/$uuid.mobileprovision ~/Library/Developer/Xcode/UserData/Provisioning\\ Profiles/ &&
+          cp /tmp/$uuid.mobileprovision ~/Library/MobileDevice/Provisioning\\ Profiles/"
+  done
+
+  local mv_arg=""; [ -n "$marketing" ] && mv_arg="MARKETING_VERSION=$marketing"
+  local env_prefix="" e
+  for e in "${envs[@]}"; do env_prefix+="export $e && "; done
+  # Default: let the project's own per-target signing config sign the archive. This preserves
+  # entitlements (game-center/healthkit/weatherkit/app-groups/…) and, being per-target, does NOT
+  # leak onto SPM package targets (the "<Package> does not support provisioning profiles" trap).
+  # --unsigned-archive is only for projects without valid signing config; then exportArchive is
+  # the sole signer and entitlements must come entirely from the profile.
+  local sign_arg="" sign_label="signed by project"
+  [ "$unsigned_archive" = 1 ] && { sign_arg="CODE_SIGNING_ALLOWED=NO"; sign_label="unsigned"; }
+  echo "== archiving build $build_number ${marketing:+marketing $marketing} ($sign_label)"
+  gssh "export PATH=/usr/local/bin:\$PATH && ${env_prefix}security unlock-keychain -p $GUEST_PASS login.keychain-db && cd builds/$name &&
+        if [ -f project.yml ]; then xcodegen generate >/dev/null; fi &&
+        xcodebuild -scheme '$scheme' -configuration Release -destination 'generic/platform=iOS' \
+          -archivePath /tmp/$name.xcarchive CURRENT_PROJECT_VERSION=$build_number $mv_arg $archive_flags \
+          $sign_arg archive 2>&1 | tail -4 && test -d /tmp/$name.xcarchive"
+
+  local pp_dict="" entry
+  for entry in "${pmap[@]}"; do
+    pp_dict+="<key>${entry%%=*}</key><string>${entry#*=}</string>"
+  done
+
+  echo "== exporting (re-sign app + extensions)"
+  gssh "cat > /tmp/ExportOptions.plist <<PLIST
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\"><dict>
+<key>method</key><string>app-store-connect</string>
+<key>teamID</key><string>$TEAM_ID</string>
+<key>signingStyle</key><string>manual</string>
+<key>signingCertificate</key><string>$SIGNING_IDENTITY</string>
+<key>manageAppVersionAndBuildNumber</key><false/>
+<key>provisioningProfiles</key><dict>$pp_dict</dict>
+<key>stripSwiftSymbols</key><true/><key>uploadSymbols</key><true/>
+<key>destination</key><string>export</string>
+</dict></plist>
+PLIST
+        security unlock-keychain -p $GUEST_PASS login.keychain-db &&
+        rm -rf /tmp/export-$name && xcodebuild -exportArchive -archivePath /tmp/$name.xcarchive \
+          -exportPath /tmp/export-$name -exportOptionsPlist /tmp/ExportOptions.plist 2>&1 | tail -2 &&
+        ls /tmp/export-$name/*.ipa"
+
+  echo "== verifying BuildMachineOSBuild is stable"
+  local bmob; bmob=$(gssh "cd /tmp && rm -rf vfy-$name && mkdir vfy-$name && cd vfy-$name && unzip -q /tmp/export-$name/*.ipa && /usr/libexec/PlistBuddy -c 'Print BuildMachineOSBuild' Payload/*.app/Info.plist")
+  echo "BuildMachineOSBuild=$bmob"
+  is_beta_build "$bmob" && die "artifact stamped with beta build $bmob — DO NOT UPLOAD"
+
+  if [ "$upload" = 1 ]; then
+    echo "== uploading to App Store Connect"
+    gssh "xcrun altool --upload-app -f /tmp/export-$name/*.ipa -t ios --apiKey $ASC_KEY_ID --apiIssuer $ASC_ISSUER_ID 2>&1 | tail -6"
+    echo "== done: build $build_number ✔"
+  else
+    echo "== built (no upload). IPA in guest: /tmp/export-$name/"
+  fi
+}
+
+cmd=${1:-status}; shift || true
+case $cmd in
+  up) cmd_up ;;
+  down) cmd_down ;;
+  ip) vm_ip ;;
+  ssh) gssh "$@" ;;
+  status) cmd_status ;;
+  provision) cmd_provision ;;
+  snapshot) cmd_snapshot "$@" ;;
+  build) cmd_build "$@" ;;
+  -h|--help|help) sed -n '3,45p' "$0" | sed 's/^### \{0,1\}//' ;;
+  *) die "unknown command: $cmd (try: up down ip ssh status provision snapshot build help)" ;;
+esac

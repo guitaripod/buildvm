@@ -1,0 +1,8 @@
+# never commit secrets or local config
+config.env
+*.p12
+*.p8
+*.mobileprovision
+*.password
+*.certSigningRequest
+.DS_Store
