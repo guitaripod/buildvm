@@ -215,7 +215,7 @@ cmd_build() {
   echo "== guest build $guest_build (stable)"
 
   local comp
-  for comp in "${components[@]}"; do
+  for comp in ${components[@]+"${components[@]}"}; do
     echo "== ensuring component $comp"
     gssh "xcodebuild -downloadComponent $comp 2>&1 | tail -1" || true
   done
@@ -250,7 +250,7 @@ cmd_build() {
 
   local mv_arg=""; [ -n "$marketing" ] && mv_arg="MARKETING_VERSION=$marketing"
   local env_prefix="" e
-  for e in "${envs[@]}"; do env_prefix+="export $e && "; done
+  for e in ${envs[@]+"${envs[@]}"}; do env_prefix+="export $e && "; done
   # Default: let the project's own per-target signing config sign the archive. This preserves
   # entitlements (game-center/healthkit/weatherkit/app-groups/…) and, being per-target, does NOT
   # leak onto SPM package targets (the "<Package> does not support provisioning profiles" trap).
