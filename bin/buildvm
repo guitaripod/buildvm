@@ -297,8 +297,14 @@ PLIST
 
   if [ "$upload" = 1 ]; then
     echo "== uploading to App Store Connect"
-    gssh "xcrun altool --upload-app -f /tmp/export-$name/*.ipa -t ios --apiKey $ASC_KEY_ID --apiIssuer $ASC_ISSUER_ID 2>&1 | tail -6"
-    echo "== done: build $build_number ✔"
+    local out
+    if out=$(gssh "xcrun altool --upload-app -f /tmp/export-$name/*.ipa -t ios --apiKey $ASC_KEY_ID --apiIssuer $ASC_ISSUER_ID 2>&1"); then
+      echo "$out" | tail -6
+      echo "== done: build $build_number ✔"
+    else
+      echo "$out" | tail -20
+      die "altool upload FAILED for build $build_number (exit above) — nothing was delivered to App Store Connect"
+    fi
   else
     echo "== built (no upload). IPA in guest: /tmp/export-$name/"
   fi

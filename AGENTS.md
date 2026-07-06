@@ -55,7 +55,10 @@ buildvm build --dir <proj> --scheme <Scheme> \
    and profile name are auto-derived from each profile's entitlements.
 4. **Trust the guard, not vibes.** `buildvm` unzips the IPA and fails if `BuildMachineOSBuild`
    looks beta. If it uploaded, the artifact is stable by construction. altool's "UPLOAD
-   SUCCEEDED" + Delivery UUID is authoritative; ASC surfacing lags (minutes).
+   SUCCEEDED" + Delivery UUID is authoritative; ASC surfacing lags (minutes). A failed
+   upload (e.g. `ENTITY_ERROR…DUPLICATE` when the build number already exists) now hard-fails
+   the run with a non-zero exit — `== done ✔` prints ONLY on a real altool success. If you
+   see `altool upload FAILED`, fix the cause (usually bump `--build`) and re-run.
 5. **Marketing-version trains:** altool rejects a build whose marketing version maps to a closed
    pre-release train (`Invalid Pre-Release Train … closed`). Pass `--marketing` for an open one.
 6. **Debug first if unsure:** `--no-upload` builds + verifies without uploading; the IPA stays in
