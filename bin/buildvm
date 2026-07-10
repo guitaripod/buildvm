@@ -219,7 +219,8 @@ cmd_build() {
   local p pf appid bid pname
   for p in "${profiles[@]}"; do
     pf=$(resolve_profile "$p")
-    appid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract Entitlements.application-identifier raw -o - -)
+    appid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract Entitlements.application-identifier raw -o - - 2>/dev/null) ||
+      appid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract 'Entitlements.com\.apple\.application-identifier' raw -o - -)
     bid=${appid#*.}                                        # strip TEAMID. prefix
     pname=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract Name raw -o - -)
     pfiles+=("$pf"); pmap+=("$bid=$pname")
@@ -277,6 +278,12 @@ cmd_build() {
             security set-key-partition-list -S apple-tool:,apple: -s -k $GUEST_PASS login.keychain-db >/dev/null 2>&1 &&
             rm -f /tmp/$ip12name"
     fi
+    # Cert generations differ in CN prefix; use whichever installer identity the guest actually has.
+    local detected_installer
+    detected_installer=$(gssh "security find-identity -v login.keychain-db" |
+      grep -oE '"(Mac Installer Distribution|3rd Party Mac Developer Installer)[^"]*"' | head -1 | tr -d '"')
+    [ -n "$detected_installer" ] && MAC_INSTALLER_IDENTITY=${detected_installer%%:*}
+    echo "== installer identity: $MAC_INSTALLER_IDENTITY"
   fi
 
   local mv_arg=""; [ -n "$marketing" ] && mv_arg="MARKETING_VERSION=$marketing"
