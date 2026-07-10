@@ -1,7 +1,7 @@
 # buildvm — agent guide
 
-You are an agent that needs to ship an iOS App Store build while the host Mac runs a **beta
-macOS**. Do NOT `xcodebuild archive` on the host — Apple rejects beta-host binaries with
+You are an agent that needs to ship an iOS (or Mac App Store) build while the host Mac runs a
+**beta macOS**. Do NOT `xcodebuild archive` on the host — Apple rejects beta-host binaries with
 ITMS-90111 (the artifact's `BuildMachineOSBuild` carries the beta stamp). Use `buildvm`: it
 archives inside a stable-macOS VM over SSH and uploads. One command per release.
 
@@ -41,6 +41,18 @@ buildvm build --dir <proj> --scheme <Scheme> \
   --archive-flags "-skipPackagePluginValidation -skipMacroValidation -scmProvider system" \
   --build <N> [--marketing <V>]
 ```
+
+macOS (Mac App Store) app:
+```bash
+buildvm build --dir <proj> --scheme <Scheme> --platform macos \
+  --profile <app.provisionprofile> \
+  --build <N> [--marketing <V>]
+```
+`--platform macos` archives with `generic/platform=macOS`, exports a `.pkg` signed with the
+Mac Installer Distribution identity (`BUILDVM_MAC_INSTALLER_P12`, password falls back to the
+dist p12 password), verifies `BuildMachineOSBuild` inside the pkg via `pkgutil --expand-full`,
+and uploads with `altool -t macos`. Mac App Store apps must be sandboxed — the entitlements
+come from the project's own signing config (never `--unsigned-archive`).
 
 ## Rules you must follow
 
