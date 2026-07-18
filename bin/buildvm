@@ -298,11 +298,15 @@ cmd_build() {
   [ "$unsigned_archive" = 1 ] && { sign_arg="CODE_SIGNING_ALLOWED=NO"; sign_label="unsigned"; }
   local dest="generic/platform=iOS"; [ "$platform" = macos ] && dest="generic/platform=macOS"
   echo "== archiving build $build_number ${marketing:+marketing $marketing} ($sign_label, $platform)"
-  gssh "export PATH=/usr/local/bin:\$PATH && ${env_prefix}security unlock-keychain -p $GUEST_PASS login.keychain-db && cd builds/$name &&
+  # pipefail + rm of any prior archive: without both, a failed xcodebuild exits 0 through
+  # `tail` and the previous run's stale archive gets re-exported and re-uploaded.
+  gssh "set -o pipefail && export PATH=/usr/local/bin:\$PATH && ${env_prefix}security unlock-keychain -p $GUEST_PASS login.keychain-db && cd builds/$name &&
         if [ -f project.yml ]; then xcodegen generate >/dev/null; fi &&
+        rm -rf /tmp/$name.xcarchive &&
         xcodebuild -scheme '$scheme' -configuration Release -destination '$dest' \
           -archivePath /tmp/$name.xcarchive CURRENT_PROJECT_VERSION=$build_number $mv_arg $archive_flags \
-          $sign_arg archive 2>&1 | tail -4 && test -d /tmp/$name.xcarchive"
+          $sign_arg archive 2>&1 | tail -25 && test -d /tmp/$name.xcarchive" ||
+    die "archive FAILED for build $build_number (xcodebuild output above)"
 
   local pp_dict="" entry
   for entry in "${pmap[@]}"; do
@@ -343,6 +347,16 @@ PLIST
   fi
   echo "BuildMachineOSBuild=$bmob"
   is_beta_build "$bmob" && die "artifact stamped with beta build $bmob — DO NOT UPLOAD"
+
+  # Catch any other stale-artifact path: the exported binary must carry the requested build number.
+  local artifact_cfbv
+  if [ "$platform" = macos ]; then
+    artifact_cfbv=$(gssh "pl=\$(find /tmp/vfy-$name -path '*.app/Contents/Info.plist' | head -1) && /usr/libexec/PlistBuddy -c 'Print CFBundleVersion' \"\$pl\"")
+  else
+    artifact_cfbv=$(gssh "/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' /tmp/vfy-$name/Payload/*.app/Info.plist")
+  fi
+  [ "$artifact_cfbv" = "$build_number" ] ||
+    die "artifact CFBundleVersion=$artifact_cfbv != requested --build $build_number — stale archive, refusing to upload"
 
   if [ "$upload" = 1 ]; then
     echo "== uploading to App Store Connect"
