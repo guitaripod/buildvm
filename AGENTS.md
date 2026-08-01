@@ -1,7 +1,7 @@
 # buildvm — agent guide
 
-You are an agent that needs to ship an iOS (or Mac App Store) build while the host Mac runs a
-**beta macOS**. Do NOT `xcodebuild archive` on the host — Apple rejects beta-host binaries with
+You are an agent that needs to ship an iOS, tvOS, visionOS or Mac App Store build while the host
+Mac runs a **beta macOS**. Do NOT `xcodebuild archive` on the host — Apple rejects beta-host binaries with
 ITMS-90111 (the artifact's `BuildMachineOSBuild` carries the beta stamp). Use `buildvm`: it
 archives inside a stable-macOS VM over SSH and uploads. One command per release.
 
@@ -53,6 +53,28 @@ Mac Installer Distribution identity (`BUILDVM_MAC_INSTALLER_P12`, password falls
 dist p12 password), verifies `BuildMachineOSBuild` inside the pkg via `pkgutil --expand-full`,
 and uploads with `altool -t macos`. Mac App Store apps must be sandboxed — the entitlements
 come from the project's own signing config (never `--unsigned-archive`).
+
+tvOS / visionOS app:
+```bash
+buildvm build --dir <proj> --scheme <Scheme> --platform tvos \
+  --profile <app.mobileprovision> --build <N> [--marketing <V>]
+
+buildvm build --dir <proj> --scheme <Scheme> --platform visionos \
+  --profile <ios-app-store.mobileprovision> --build <N> [--marketing <V>]
+```
+Both export a plain `.ipa` like `ios` and differ only in the archive destination and the altool
+platform (`appletvos` / `visionos`). Two things are not obvious:
+
+- **visionOS has no visionOS profile.** The ASC API's `profileType` enum stops at Mac Catalyst —
+  there is no `VISIONOS_*`. Sign a visionOS App Store build with the team's **`IOS_APP_STORE`**
+  profile: its `Platform` array is `["iOS", "xrOS", "visionOS"]` and Xcode accepts it for
+  `sdk=xros*`. tvOS does have its own `TVOS_APP_STORE` type; use it.
+- **The platform support package is downloaded on demand.** A guest provisioned for iOS still
+  lists tvOS/visionOS under `xcodebuild -showsdks`, then fails the archive with
+  `generic/platform=tvOS … is not installed`. `buildvm` now runs `xcodebuild -downloadPlatform`
+  before every archive — free once installed, but the **first** tvOS build costs ~4 GB / 2 min
+  and the first visionOS build ~7.5 GB / 6 min. Budget guest disk accordingly (all four
+  platforms plus Xcode need well over 40 GB).
 
 ## Rules you must follow
 

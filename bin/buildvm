@@ -21,11 +21,17 @@ set -euo pipefail
 ### buildvm build options:
 ###   --dir DIR                 project directory (rsynced to the guest)
 ###   --scheme SCHEME           xcodebuild scheme
-###   --platform ios|macos      target platform (default ios). macos archives with
-###                             generic/platform=macOS, exports a signed .pkg (requires the
-###                             Mac Installer Distribution p12: BUILDVM_MAC_INSTALLER_P12,
-###                             password via BUILDVM_MAC_INSTALLER_P12_PASSWORD[_FILE] or the
-###                             dist p12 password), and uploads with altool -t macos.
+###   --platform P              ios (default) | tvos | visionos | macos. tvos and visionos
+###                             archive and export .ipa exactly like ios, differing only in the
+###                             archive destination and the altool platform (appletvos/visionos);
+###                             their App Store profiles are .mobileprovision (a visionOS app is
+###                             signed by the team's IOS_APP_STORE profile, whose Platform array
+###                             already covers xrOS/visionOS — the ASC API has no visionOS
+###                             profile type). macos archives with generic/platform=macOS,
+###                             exports a signed .pkg (requires the Mac Installer Distribution
+###                             p12: BUILDVM_MAC_INSTALLER_P12, password via
+###                             BUILDVM_MAC_INSTALLER_P12_PASSWORD[_FILE] or the dist p12
+###                             password), and uploads with altool -t macos.
 ###   --profile FILE            provisioning profile; repeat once per target (app + each
 ###                             extension). Bundle-id + profile name are auto-derived. FILE is
 ###                             a path or a name resolved against $BUILDVM_SIGNING_DIR.
@@ -82,6 +88,19 @@ installer_p12_password() {
 
 ### A macOS build number is a beta if it ends digits+letter+5xx…+lowercase, e.g. 26A5353q.
 is_beta_build() { [[ "$1" =~ [A-Z]5[0-9]{2,}[a-z]$ ]]; }
+
+### Everything that varies per --platform: archive destination, artifact extension, profile
+### extension, the altool platform token, and the -downloadPlatform token (empty for macOS,
+### whose SDK ships with Xcode), emitted as one tab-separated record.
+platform_traits() {
+  case $1 in
+    ios)      printf 'generic/platform=iOS\tipa\tmobileprovision\tios\tiOS\n';;
+    tvos)     printf 'generic/platform=tvOS\tipa\tmobileprovision\tappletvos\ttvOS\n';;
+    visionos) printf 'generic/platform=visionOS\tipa\tmobileprovision\tvisionos\tvisionOS\n';;
+    macos)    printf 'generic/platform=macOS\tpkg\tprovisionprofile\tmacos\t\n';;
+    *) return 1;;
+  esac
+}
 
 resolve_profile() {
   local p=$1
@@ -176,6 +195,14 @@ cmd_provision() {
   echo "TIP: run 'buildvm snapshot' to preserve this state as a reusable base."
 }
 
+### `xcodebuild -showsdks` lists tvOS/visionOS even when their platform support package is
+### missing, and the archive then dies with "generic/platform=tvOS … is not installed".
+### -downloadPlatform installs it and is a sub-second no-op once present, so it runs every build.
+ensure_platform() {
+  echo "== ensuring $1 platform"
+  gssh "xcodebuild -downloadPlatform $1 2>&1 | tail -1" || die "could not install the $1 platform in the guest"
+}
+
 cmd_snapshot() {
   local name=${1:-${VM}-provisioned}
   cmd_down
@@ -209,7 +236,9 @@ cmd_build() {
   [ -d "$dir" ] || die "no such --dir: $dir"
   [ -n "$scheme" ] && [ -n "$build_number" ] || die "need --scheme --build"
   [ ${#profiles[@]} -gt 0 ] || die "need at least one --profile"
-  case $platform in ios|macos) ;; *) die "unknown --platform: $platform (ios|macos)";; esac
+  local dest artifact_ext pext atype dlplatform
+  IFS=$'\t' read -r dest artifact_ext pext atype dlplatform < <(platform_traits "$platform") ||
+    die "unknown --platform: $platform (ios|tvos|visionos|macos)"
   [ "$platform" = macos ] && need MAC_INSTALLER_P12
   need TEAM_ID
   [ "$upload" = 1 ] && { need ASC_KEY_ID; need ASC_ISSUER_ID; }
@@ -232,6 +261,8 @@ cmd_build() {
   is_beta_build "$guest_build" && die "guest macOS $guest_build is BETA — would trip ITMS-90111"
   echo "== guest build $guest_build (stable)"
 
+  [ -n "$dlplatform" ] && ensure_platform "$dlplatform"
+
   local comp
   for comp in ${components[@]+"${components[@]}"}; do
     echo "== ensuring component $comp"
@@ -248,7 +279,8 @@ cmd_build() {
 
   echo "== syncing $name → guest"
   gssh 'mkdir -p ~/builds'
-  rsync -a --delete --exclude .git --exclude DerivedData --exclude build --exclude '*.xcuserstate' \
+  rsync -a --delete --exclude .git --exclude DerivedData --exclude build --exclude .build \
+    --exclude '*.xcuserstate' \
     -e "ssh ${SSH_OPTS[*]}" "$dir/" "$GUEST_USER@$ip:builds/$name/"
 
   if [ -n "$prebuild" ]; then
@@ -258,7 +290,6 @@ cmd_build() {
   fi
 
   echo "== installing ${#pfiles[@]} profile(s)"
-  local pext="mobileprovision"; [ "$platform" = macos ] && pext="provisionprofile"
   gssh "mkdir -p ~/Library/Developer/Xcode/UserData/Provisioning\\ Profiles ~/Library/MobileDevice/Provisioning\\ Profiles"
   for pf in "${pfiles[@]}"; do
     local uuid; uuid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract UUID raw -o - -)
@@ -296,7 +327,6 @@ cmd_build() {
   # the sole signer and entitlements must come entirely from the profile.
   local sign_arg="" sign_label="signed by project"
   [ "$unsigned_archive" = 1 ] && { sign_arg="CODE_SIGNING_ALLOWED=NO"; sign_label="unsigned"; }
-  local dest="generic/platform=iOS"; [ "$platform" = macos ] && dest="generic/platform=macOS"
   echo "== archiving build $build_number ${marketing:+marketing $marketing} ($sign_label, $platform)"
   # pipefail + rm of any prior archive: without both, a failed xcodebuild exits 0 through
   # `tail` and the previous run's stale archive gets re-exported and re-uploaded.
@@ -315,7 +345,7 @@ cmd_build() {
 
   local installer_key=""
   [ "$platform" = macos ] && installer_key="<key>installerSigningCertificate</key><string>$MAC_INSTALLER_IDENTITY</string>"
-  local artifact_glob="/tmp/export-$name/*.ipa"; [ "$platform" = macos ] && artifact_glob="/tmp/export-$name/*.pkg"
+  local artifact_glob="/tmp/export-$name/*.$artifact_ext"
   echo "== exporting (re-sign app + extensions)"
   gssh "cat > /tmp/ExportOptions.plist <<PLIST
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
@@ -360,7 +390,7 @@ PLIST
 
   if [ "$upload" = 1 ]; then
     echo "== uploading to App Store Connect"
-    local out atype="ios"; [ "$platform" = macos ] && atype="macos"
+    local out
     if out=$(gssh "xcrun altool --upload-app -f $artifact_glob -t $atype --apiKey $ASC_KEY_ID --apiIssuer $ASC_ISSUER_ID 2>&1"); then
       echo "$out" | tail -6
       echo "== done: build $build_number ✔"
@@ -383,6 +413,6 @@ case $cmd in
   provision) cmd_provision ;;
   snapshot) cmd_snapshot "$@" ;;
   build) cmd_build "$@" ;;
-  -h|--help|help) sed -n '3,45p' "$0" | sed 's/^### \{0,1\}//' ;;
+  -h|--help|help) sed -n '3,49p' "$0" | sed 's/^### \{0,1\}//' ;;
   *) die "unknown command: $cmd (try: up down ip ssh status provision snapshot build help)" ;;
 esac
