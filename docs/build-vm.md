@@ -52,7 +52,6 @@ buildvm build \
   --dir  ~/Dev/ios/solarbeam \
   --scheme solarbeam-ios \
   --profile solarbeam-ios-appstore-2026.mobileprovision \   # name in <signing-dir>/ or a path
-  --bundle-id com.marcusziade.solarbeam \
   --build 141 [--marketing 3.0.1] \
   [--prebuild ./ci-secrets.sh] [--deploy-key <your-private-spm-deploy-key>] \
   [--no-upload]
@@ -65,12 +64,12 @@ The `build` flow:
 3. rsyncs the project into the guest.
 4. (`--prebuild`) runs a script in the project dir first — for `Secrets.swift` generation,
    `xcodegen`, etc. (xcodegen also runs automatically if `project.yml` is present).
-5. **Two-phase signing** (the important part): archives with `CODE_SIGNING_ALLOWED=NO`,
-   then `-exportArchive` re-signs **only the .app** via a generated `ExportOptions.plist`
-   (manual, `Apple Distribution`, the profile mapped to the bundle id). This avoids the
-   `<Package> does not support provisioning profiles` failure you get when global
-   `PROVISIONING_PROFILE_SPECIFIER` leaks onto SPM package targets (MidgarKit,
-   RevenueCat, Lottie).
+5. **Signing** (the important part): the archive is signed by the project's own per-target
+   Release config (Manual + Apple Distribution + the App Store profiles), which preserves
+   entitlements and, being per-target, does not leak a global `PROVISIONING_PROFILE_SPECIFIER`
+   onto SPM package targets (the `<Package> does not support provisioning profiles` failure).
+   `-exportArchive` then re-signs app + extensions from a generated `ExportOptions.plist`
+   (manual, `Apple Distribution`, each profile mapped to its bundle id).
 6. Unzips the IPA and **fails hard if `BuildMachineOSBuild` looks like a beta** — the
    whole point, verified on the actual artifact, not the host.
 7. `xcrun altool --upload-app` (unless `--no-upload`).
@@ -126,3 +125,35 @@ Verify entitlements survived before uploading:
   its stability matters. Xcode version doesn't trigger ITMS-90111 — only the host-OS build.
 - Vault paths: signing in `<signing-dir>/`, ASC key id/issuer in
   `~/.config/buildvm/config.env` (`ASC_KEY_ID`, `ASC_ISSUER_ID`).
+
+## 0.2: preflight, persistent state, one-command releases
+
+- **Preflight** (`--no-preflight` skips the profile/cert part): every profile must be unexpired
+  (warns under 14 days), must be an App Store profile (a profile with `ProvisionedDevices` is
+  development/ad-hoc), should list the platform, and one of its `DeveloperCertificates` must be a
+  valid identity in the guest. The git tree must not be behind its upstream (a stale checkout once
+  nearly shipped without nine commits of shipped work; `--allow-stale` overrides, a dirty tree
+  only warns). A build number the ledger already records as uploaded for this app, platform and
+  version is refused (`--force`).
+- **Persistent DerivedData.** `-derivedDataPath ~/dd/<name>-<platform>` is reused between builds,
+  so a second build is incremental and packages are not re-resolved. Previously every staged copy
+  (`solarbeam-4.1.2`, `app-release-1.4.9`) was a new project to Xcode with its own full DerivedData
+  under `~/Library/Developer/Xcode/DerivedData`, which is how the 111 GB guest filled up twice.
+  The project identity is `--name`, else `name` in `.buildvm`, else the directory name minus a
+  trailing version. `--clean` discards a project's DerivedData.
+- **Disk.** Below `BUILDVM_MIN_FREE_GB` (20) the build prunes scratch, then the oldest DerivedData,
+  then trees untouched for 14 days; below `BUILDVM_HARD_MIN_FREE_GB` (8) it stops. Archives and
+  exports are deleted after a successful upload. `buildvm clean` does the same on demand;
+  `clean --all` wipes `~/dd` and `~/builds`.
+- **Lock.** `~/.local/state/buildvm/lock` serialises runs: a second `buildvm build` waits (up to
+  `BUILDVM_LOCK_WAIT`) rather than clobbering the first one's archive.
+- **Failures.** The xcodebuild log is written in the guest, its errors are printed, and the whole
+  log is copied to `~/.local/state/buildvm/logs/`. SSH keepalives stop a silent archive from
+  looking like a dropped build.
+- **Upload.** altool is retried on network errors, timeouts and 5xx; the Delivery UUID is parsed.
+- **`.buildvm` + `ship`.** A project file lists the targets once; `buildvm ship --build N
+  --marketing V` builds them all under one lock and one VM boot.
+- **Ledger and `RESULT`.** `~/.local/state/buildvm/builds.tsv` records every run (time, app,
+  platform, version, build, git sha, outcome, delivery UUID, seconds); each build prints one
+  `RESULT {json}` line.
+- **Tests.** `test/run.sh` exercises everything that does not need the VM.

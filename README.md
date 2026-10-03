@@ -52,10 +52,14 @@ buildvm build --dir ~/code/MyApp --scheme MyApp \
 
 | command | what it does |
 |---|---|
-| `buildvm status` | VM state, guest OS build, Xcode version, valid-identity count |
+| `buildvm status [--json]` | VM state, guest OS build, Xcode, signing identities, free disk |
+| `buildvm doctor` | check every moving part; non-zero exit if anything is wrong |
 | `buildvm provision` | one-time: SSH key, copy Xcode, download iOS platform + xcodegen, import signing + Apple WWDR chain + ASC key |
 | `buildvm snapshot [name]` | stop + clone the provisioned VM as a reusable base |
-| `buildvm build …` | rsync project → archive → export → verify stable → upload |
+| `buildvm build …` | preflight → rsync → archive → export → verify stable → upload, one platform |
+| `buildvm ship --build N` | `build` for every target in the project's `.buildvm`, under one lock |
+| `buildvm clean [--all]` | reclaim guest disk (archives, old DerivedData, old trees) |
+| `buildvm history [N]` | the last builds this machine ran |
 | `buildvm up / down / ip / ssh [cmd]` | VM lifecycle / shell into the guest |
 
 See **[AGENTS.md](AGENTS.md)** for the agent-facing playbook and **[docs/build-vm.md](docs/build-vm.md)**
@@ -69,7 +73,12 @@ for the full runbook, multi-target apps, and the non-obvious gotchas.
 3. Archives with the **project's own per-target signing** (preserves entitlements; no leak onto
    SPM package targets), then `-exportArchive` produces the signed IPA.
 4. Unzips the IPA and **fails hard if `BuildMachineOSBuild` looks beta** — the whole point.
-5. `xcrun altool --upload-app`.
+5. `xcrun altool --upload-app`, retried on network errors, recording the Delivery UUID.
+
+Around that: a preflight that fails in seconds (expired or non-App-Store profile, a certificate
+the guest does not hold, a git tree behind its upstream, a build number already uploaded), a host
+lock so concurrent runs queue, persistent per-app DerivedData for incremental builds, automatic
+guest-disk management, full logs saved on failure, and a final `RESULT {json}` line for agents.
 
 Public source, no license — use at your own risk. PRs welcome; it improves as it meets more app
 shapes.

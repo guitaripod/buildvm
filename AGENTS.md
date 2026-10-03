@@ -76,6 +76,48 @@ platform (`appletvos` / `visionos`). Two things are not obvious:
   and the first visionOS build ~7.5 GB / 6 min. Budget guest disk accordingly (all four
   platforms plus Xcode need well over 40 GB).
 
+## Faster, safer shipping (0.2)
+
+- **`buildvm doctor`** first when anything feels off: VM, keyed ssh, guest OS stable, a *release*
+  Xcode in the guest, signing identities, ASC key, guest disk, stale build lock. Non-zero exit if
+  anything is wrong.
+- **One run at a time.** Concurrent invocations queue behind a host lock
+  (`~/.local/state/buildvm/lock`) instead of overwriting each other's archive in the guest. A dead
+  owner's lock is cleared automatically.
+- **Project file, one command per release.** Put a `.buildvm` in the repo and ship every platform:
+  ```
+  name solarbeam
+  exclude marketing
+  target ios --scheme solarbeam-ios --platform ios --profile app.mobileprovision --profile widget.mobileprovision
+  target mac --scheme solarbeam-mac --platform macos --profile mac.provisionprofile
+  ```
+  `buildvm ship --build 166 --marketing 4.1.2 [--only ios,mac] [--keep-going] [--no-upload] [--down]`
+  builds the targets in order under one lock and prints `ship summary: ios ✔ mac ✔`.
+- **Project identity (`--name`).** The guest tree and DerivedData are keyed by the app, not the
+  staging directory, so `solarbeam-4.1.2/` and `solarbeam-4.1.3/` share incremental state. Default:
+  `name` in `.buildvm`, else the directory name minus a trailing version (`app-release-1.4.9` →
+  `app`). DerivedData is kept per app and platform (`~/dd/<name>-<platform>`) and reused, so the
+  second build of an app is incremental; `--clean` discards it.
+- **Disk is managed for you.** Below `$BUILDVM_MIN_FREE_GB` (default 20) a build first prunes
+  scratch (archives, exports, logs), then the least-recently-built DerivedData, then project trees
+  untouched for 14 days; below `$BUILDVM_HARD_MIN_FREE_GB` (default 8) it stops with a clear
+  message. Archives and exports are deleted after a successful upload (`--keep-artifacts` keeps
+  them). `buildvm clean [--all] [--days N]` does it on demand.
+- **Preflight fails in seconds, not after a 10-minute archive:** profile expired (warns under 14
+  days) or not an App Store profile, the guest holds none of the profile's certificates, the git
+  tree is behind its upstream (`--allow-stale` to override; a dirty tree only warns), the build
+  number was already uploaded for this app/platform/version (`--force`), the guest's Xcode is a
+  beta. `--no-preflight` skips the profile/certificate checks.
+- **Failures explain themselves.** The compile/sign errors are printed and the full xcodebuild log
+  is copied to `~/.local/state/buildvm/logs/<name>-<platform>-<build>-<phase>.log`.
+- **altool retries** network errors, timeouts and 5xx up to `$BUILDVM_UPLOAD_ATTEMPTS` (3) times,
+  never a rejected build number or a bad binary.
+- **Parse the `RESULT` line.** Every build ends with one JSON line:
+  `RESULT {"ok":true,"name":"solarbeam","platform":"ios","marketing":"4.1.2","build":"166","outcome":"uploaded","delivery":"<uuid>","buildMachineOSBuild":"25F71","seconds":412}`
+  (`outcome` is `uploaded`, `built` with `--no-upload`, or `failed:<phase>`), followed by
+  `timings:`. `buildvm history [N]` lists past runs; `buildvm status --json` is machine-readable.
+- `.buildvmignore`-style excludes: `--exclude PATTERN` (repeatable) or `exclude` lines in `.buildvm`.
+
 ## Rules you must follow
 
 1. **Pass every `${VAR}` the project.yml references as `--env`.** Miss one and xcodegen bakes an
@@ -95,8 +137,8 @@ platform (`appletvos` / `visionos`). Two things are not obvious:
    see `altool upload FAILED`, fix the cause (usually bump `--build`) and re-run.
 5. **Marketing-version trains:** altool rejects a build whose marketing version maps to a closed
    pre-release train (`Invalid Pre-Release Train … closed`). Pass `--marketing` for an open one.
-6. **Debug first if unsure:** `--no-upload` builds + verifies without uploading; the IPA stays in
-   the guest at `/tmp/export-<name>/`.
+6. **Debug first if unsure:** `--no-upload` builds + verifies without uploading; the artifact stays
+   in the guest at `/tmp/export-<name>-<platform>/`.
 
 ## Attaching + submitting (App Store Connect API, separate from buildvm)
 

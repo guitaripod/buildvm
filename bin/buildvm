@@ -13,13 +13,25 @@ set -euo pipefail
 ### See config.example.env. No secrets live in this repo.
 ###
 ### Commands:
-###   buildvm up | down | ip | status | ssh [cmd]
+###   buildvm up | down | ip | status [--json] | ssh [cmd]
+###   buildvm doctor                    check every moving part; non-zero if anything is wrong
 ###   buildvm provision                 one-time: Xcode + iOS platform + signing identity + tools
 ###   buildvm snapshot [name]           stop + clone the provisioned VM as a reusable base
 ###   buildvm build --dir D --scheme S --profile F... --build N [options]
+###   buildvm ship --build N [--marketing V] [--only a,b] [--dir D]    every target in D/.buildvm
+###   buildvm clean [--all] [--days N]  reclaim guest disk (archives, DerivedData, old trees)
+###   buildvm history [N]               the last N builds this machine ran (default 15)
+###   buildvm --version
+###
+### One run at a time: concurrent invocations queue behind a host lock instead of corrupting
+### each other's archive. Every build ends with one machine-readable `RESULT {json}` line.
 ###
 ### buildvm build options:
 ###   --dir DIR                 project directory (rsynced to the guest)
+###   --name NAME               project identity: names the guest tree and its DerivedData, so
+###                             builds of the same app share incremental state. Default: `name`
+###                             from DIR/.buildvm, else DIR's basename minus a trailing version
+###                             (solarbeam-4.1.2 → solarbeam)
 ###   --scheme SCHEME           xcodebuild scheme
 ###   --platform P              ios (default) | tvos | visionos | macos. tvos and visionos
 ###                             archive and export .ipa exactly like ios, differing only in the
@@ -39,14 +51,36 @@ set -euo pipefail
 ###   --marketing V             CFBundleShortVersionString (MARKETING_VERSION); optional
 ###   --env KEY=VAL             repeatable; exported before xcodegen for ${VAR} substitution
 ###   --component NAME          repeatable Xcode component to ensure (e.g. MetalToolchain)
-###   --deploy-key FILE         SSH key for private SPM deps (cloned over git@github.com)
+###   --deploy-key FILE         SSH key for private SPM deps (cloned over git@github.com);
+###                             a path or a name resolved against $BUILDVM_SIGNING_DIR
 ###   --prebuild SCRIPT         local script run in the project dir on the guest before archive
 ###                             (Secrets generation, etc.)
 ###   --archive-flags "..."     extra xcodebuild archive flags
+###   --exclude PATTERN         repeatable rsync exclude (also: `exclude` lines in .buildvm)
 ###   --unsigned-archive        archive with CODE_SIGNING_ALLOWED=NO (only for projects lacking
 ###                             valid per-target signing config; then the profile is the sole
 ###                             entitlement source)
 ###   --no-upload               build + verify but skip altool upload
+###   --clean                   discard this project's DerivedData first (default: reuse it, so
+###                             a second build of the same app is incremental)
+###   --keep-artifacts          keep the archive/export in the guest after a successful upload
+###   --allow-stale             build even though the git tree is behind its upstream
+###   --force                   build even though this build number was already uploaded
+###   --no-preflight            skip the profile/certificate checks
+###   --down                    stop the VM when the build finishes
+###
+### Preflight, before any time is spent: profile expiry / App Store type / signing cert present
+### in the guest, git tree not behind upstream (warns when dirty), build number not already
+### uploaded, guest disk above $BUILDVM_MIN_FREE_GB (default 20; pruned automatically).
+###
+### .buildvm (in the project dir; `#` comments):
+###   name solarbeam
+###   exclude marketing
+###   target ios --scheme solarbeam-ios --platform ios --profile app.mobileprovision --profile widget.mobileprovision
+###   target mac --scheme solarbeam-mac --platform macos --profile mac.provisionprofile
+### `buildvm ship --build N --marketing V` builds every target in order (--only a,b to pick).
+
+BUILDVM_VERSION=0.2.0
 
 # ---- config -----------------------------------------------------------------
 BUILDVM_CONFIG=${BUILDVM_CONFIG:-$HOME/.config/buildvm/config.env}
@@ -72,11 +106,29 @@ ASC_KEY_ID=${BUILDVM_ASC_KEY_ID:-}
 ASC_ISSUER_ID=${BUILDVM_ASC_ISSUER_ID:-}
 ASC_KEY_P8=${BUILDVM_ASC_KEY_P8:-}
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+STATE_DIR=${BUILDVM_STATE_DIR:-$HOME/.local/state/buildvm}
+LEDGER=$STATE_DIR/builds.tsv
+LOG_DIR=$STATE_DIR/logs
+LOCK_DIR=$STATE_DIR/lock
+MIN_FREE_GB=${BUILDVM_MIN_FREE_GB:-20}
+HARD_MIN_FREE_GB=${BUILDVM_HARD_MIN_FREE_GB:-8}
+LOCK_WAIT=${BUILDVM_LOCK_WAIT:-3600}
+UPLOAD_ATTEMPTS=${BUILDVM_UPLOAD_ATTEMPTS:-3}
+
+### Keepalives matter: an archive is minutes of silence on the wire, and an idle connection that
+### a NAT or the VM's network stack drops mid-build would otherwise read as a build failure.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+          -o ServerAliveInterval=30 -o ServerAliveCountMax=20)
 
 die() { echo "buildvm: $*" >&2; exit 1; }
+warn() { echo "buildvm: warning: $*" >&2; }
 need() { [ -n "${!1:-}" ] || die "config $1 is required (set it in $BUILDVM_CONFIG or the environment)"; }
-vm_ip() { "$TART" ip "$VM" 2>/dev/null; }
+### `tart ip` keeps answering with the last DHCP lease for a while after the VM has stopped, so
+### "has an IP" is not "is running": a build after `buildvm down` would otherwise never boot the
+### VM and wait out its whole timeout.
+vm_state() { "$TART" list 2>/dev/null | awk -v vm="$VM" '$2 == vm {print $NF}'; }
+vm_running() { [ "$(vm_state)" = running ]; }
+vm_ip() { vm_running || return 1; "$TART" ip "$VM" 2>/dev/null; }
 gssh() { local ip; ip=$(vm_ip) || die "VM not running"; ssh "${SSH_OPTS[@]}" "$GUEST_USER@$ip" "$@"; }
 gscp() { scp "${SSH_OPTS[@]}" "$@"; }
 p12_password() { [ -n "$DIST_P12_PASSWORD_FILE" ] && cat "$DIST_P12_PASSWORD_FILE" || printf '%s' "$DIST_P12_PASSWORD"; }
@@ -85,6 +137,8 @@ installer_p12_password() {
   elif [ -n "$MAC_INSTALLER_P12_PASSWORD" ]; then printf '%s' "$MAC_INSTALLER_P12_PASSWORD"
   else p12_password; fi
 }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+json_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 ### A macOS build number is a beta if it ends digits+letter+5xx…+lowercase, e.g. 26A5353q.
 is_beta_build() { [[ "$1" =~ [A-Z]5[0-9]{2,}[a-z]$ ]]; }
@@ -109,9 +163,87 @@ resolve_profile() {
   die "no such --profile: $p"
 }
 
+### The project's identity, so every build of an app lands in the same guest tree and reuses the
+### same DerivedData. Staged copies are named for their version (solarbeam-4.1.2,
+### app-release-1.4.9) and without this each one was a brand-new project to Xcode: a full clean
+### build, and 30+ GB of DerivedData after a few releases.
+derive_name() {
+  local base; base=$(basename "$1")
+  printf '%s' "$base" | sed -E 's/[-_.](release([-_.]v?[0-9]+(\.[0-9]+)*)?|v?[0-9]+(\.[0-9]+)*)$//'
+}
+
+# ---- locking ----------------------------------------------------------------
+LOCK_OWNER=0
+acquire_lock() {
+  [ "$LOCK_OWNER" = 1 ] && return 0
+  [ "${BUILDVM_LOCK_HELD:-0}" = 1 ] && return 0
+  mkdir -p "$STATE_DIR"
+  local waited=0 owner
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if { [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; } ||
+       { [ -z "$owner" ] && [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]; }; then
+      warn "clearing a stale build lock (pid ${owner:-unknown} is gone)"
+      rm -rf "$LOCK_DIR"; continue
+    fi
+    [ "$waited" -ge "$LOCK_WAIT" ] && die "gave up after ${waited}s waiting for the build lock held by pid ${owner:-?}"
+    [ $((waited % 30)) -eq 0 ] && echo "== waiting for another buildvm run (pid ${owner:-?}: $(cat "$LOCK_DIR/what" 2>/dev/null || echo unknown))" >&2
+    sleep 5; waited=$((waited + 5))
+  done
+  echo $$ > "$LOCK_DIR/pid"; echo "${1:-buildvm}" > "$LOCK_DIR/what"
+  LOCK_OWNER=1
+}
+release_lock() { [ "$LOCK_OWNER" = 1 ] && rm -rf "$LOCK_DIR"; LOCK_OWNER=0; return 0; }
+
+# ---- phases, timings, ledger, exit report --------------------------------------
+PHASE=""; PHASE_START=0; TIMINGS=""
+RUN_CTX=0; RUN_NAME=""; RUN_PLATFORM=""; RUN_MARKETING=""; RUN_BUILD=""; RUN_SHA=""
+RUN_DELIVERY=""; RUN_BMOB=""; RUN_OUTCOME="built"; RUN_START=0
+
+end_phase() { [ -n "$PHASE" ] && TIMINGS="$TIMINGS$PHASE=$((SECONDS - PHASE_START))s "; return 0; }
+phase() { end_phase; PHASE=$1; PHASE_START=$SECONDS; echo "== $2"; }
+
+ledger_add() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now_iso)" "$RUN_NAME" "$RUN_PLATFORM" "${RUN_MARKETING:--}" \
+    "$RUN_BUILD" "${RUN_SHA:--}" "$1" "${RUN_DELIVERY:--}" "$((SECONDS - RUN_START))" >> "$LEDGER"
+}
+
+### 0 (exit status) when the ledger records this exact build as already uploaded.
+ledger_has_upload() {
+  [ -f "$LEDGER" ] || return 1
+  awk -F'\t' -v n="$1" -v p="$2" -v m="${3:--}" -v b="$4" \
+    '$2==n && $3==p && $4==m && $5==b && $7=="uploaded" {found=1} END {exit found ? 0 : 1}' "$LEDGER"
+}
+
+### The highest build number the ledger holds as uploaded for this app, platform and version.
+ledger_max_build() {
+  [ -f "$LEDGER" ] || return 0
+  awk -F'\t' -v n="$1" -v p="$2" -v m="${3:--}" \
+    '$2==n && $3==p && $4==m && $7=="uploaded" && $5+0 > max {max=$5+0} END {if (max) print max}' "$LEDGER"
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [ "$RUN_CTX" = 1 ]; then
+    end_phase
+    local outcome=$RUN_OUTCOME ok=true
+    if [ "$rc" -ne 0 ]; then outcome="failed:${PHASE:-setup}"; ok=false; fi
+    ledger_add "$outcome" 2>/dev/null || true
+    printf 'RESULT {"ok":%s,"name":"%s","platform":"%s","marketing":"%s","build":"%s","outcome":"%s","delivery":"%s","buildMachineOSBuild":"%s","seconds":%s}\n' \
+      "$ok" "$(json_str "$RUN_NAME")" "$RUN_PLATFORM" "$(json_str "$RUN_MARKETING")" "$RUN_BUILD" \
+      "$(json_str "$outcome")" "$RUN_DELIVERY" "$RUN_BMOB" "$((SECONDS - RUN_START))"
+    [ -n "$TIMINGS" ] && echo "timings: $TIMINGS"
+  fi
+  release_lock
+  exit "$rc"
+}
+
+# ---- VM lifecycle -------------------------------------------------------------
 cmd_up() {
   need TART
-  if ! vm_ip >/dev/null 2>&1; then
+  if ! vm_running; then
     nohup "$TART" run "$VM" --no-graphics >/tmp/buildvm-run.log 2>&1 &
   fi
   local ip
@@ -126,17 +258,98 @@ cmd_up() {
 
 cmd_down() { "$TART" stop "$VM" 2>/dev/null || true; }
 
+### A beta or seed Xcode carries a trailing lowercase letter on its build number (27A266a); a
+### release does not (17F113). App Store uploads need a release Xcode, so the guest must hold one.
+is_beta_xcode() { [[ "$1" =~ [0-9][a-z]$ ]]; }
+
+host_xcode_build() { xcodebuild -version 2>/dev/null | awk '/Build version/ {print $3}'; }
+
+### Says so when the guest builds with an older release Xcode than this Mac has. Silent when this
+### Mac's Xcode is a beta — the guest is supposed to hold the release one then — or when they agree.
+xcode_drift() { # host guest
+  [ -n "$1" ] && [ -n "$2" ] && [ "$1" != "$2" ] && ! is_beta_xcode "$1" &&
+    echo "guest Xcode $2 differs from this Mac's release Xcode $1 — App Store requires the current release"
+  return 0
+}
+guest_xcode_build() { gssh 'xcodebuild -version 2>/dev/null' 2>/dev/null | awk '/Build version/ {print $3}'; }
+guest_free_gb() { gssh 'df -g "$HOME" | awk "NR==2 {print \$4}"' 2>/dev/null; }
+guest_identity_hashes() { gssh 'security find-identity -v -p codesigning login.keychain-db' 2>/dev/null | grep -oE '[0-9A-F]{40}' || true; }
+
 cmd_status() {
-  "$TART" list 2>/dev/null | grep -E "Name|$VM" || true
-  local ip
+  local json=0; [ "${1:-}" = "--json" ] && json=1
+  local ip="" up=false os="" xcode="" ids=0 free="" hostx guestx=""
+  hostx=$(host_xcode_build || true)
   if ip=$(vm_ip) && ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 -o BatchMode=yes "$GUEST_USER@$ip" true 2>/dev/null; then
+    up=true
+    os=$(gssh 'echo "$(sw_vers -productVersion) ($(sw_vers -buildVersion))"' 2>/dev/null)
+    xcode=$(gssh 'xcodebuild -version 2>/dev/null | tr "\n" " "' 2>/dev/null)
+    guestx=$(guest_xcode_build || true)
+    ids=$(guest_identity_hashes | wc -l | tr -d ' ')
+    free=$(guest_free_gb || true)
+  fi
+  if [ "$json" = 1 ]; then
+    printf '{"vm":"%s","running":%s,"ip":"%s","os":"%s","xcode":"%s","hostXcodeBuild":"%s","guestXcodeBuild":"%s","identities":%s,"freeGB":%s,"buildvm":"%s"}\n' \
+      "$VM" "$up" "$ip" "$(json_str "$os")" "$(json_str "$xcode")" "$hostx" "$guestx" "${ids:-0}" "${free:-0}" "$BUILDVM_VERSION"
+    return 0
+  fi
+  "$TART" list 2>/dev/null | grep -E "Name|$VM" || true
+  if [ "$up" = true ]; then
     echo "ip: $ip"
-    gssh 'echo "os: $(sw_vers -productVersion) ($(sw_vers -buildVersion))"; xcodebuild -version 2>/dev/null | tr "\n" " "; echo; echo "valid identities: $(security find-identity -v -p codesigning login.keychain-db 2>/dev/null | grep -c valid)"' 2>/dev/null
+    echo "os: $os"
+    echo "$xcode"
+    echo "valid identities: $ids"
+    echo "free disk: ${free:-?} GB (floor $MIN_FREE_GB)"
+    local drift; drift=$(xcode_drift "$hostx" "$guestx")
+    [ -z "$drift" ] || echo "xcode drift: $drift"
+    ! is_beta_xcode "$guestx" || echo "xcode: the guest's Xcode $guestx is a BETA — App Store uploads need a release Xcode"
   else
     echo "(stopped — run 'buildvm up')"
   fi
 }
 
+# ---- doctor -------------------------------------------------------------------
+DOCTOR_FAILS=0
+check() { # label, ok(0|1), detail
+  if [ "$2" = 0 ]; then echo "  ✔ $1${3:+ — $3}"; else echo "  ✖ $1${3:+ — $3}"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); fi
+}
+
+cmd_doctor() {
+  echo "buildvm $BUILDVM_VERSION"
+  [ -x "$TART" ] && check "tart" 0 "$TART" || check "tart" 1 "not found (set BUILDVM_TART)"
+  "$TART" list 2>/dev/null | grep -q "[[:space:]]$VM[[:space:]]" && check "vm '$VM' exists" 0 || check "vm '$VM' exists" 1 "tart clone $BASE_IMAGE $VM"
+  local ip
+  if ip=$(cmd_up 2>/dev/null); then
+    check "vm reachable over keyed ssh" 0 "$ip"
+  else
+    check "vm reachable over keyed ssh" 1 "run 'buildvm provision'"
+    echo "doctor: $DOCTOR_FAILS problem(s)"; return 1
+  fi
+  local guest_build; guest_build=$(gssh 'sw_vers -buildVersion')
+  is_beta_build "$guest_build" && check "guest macOS is stable" 1 "$guest_build is a BETA" || check "guest macOS is stable" 0 "$guest_build"
+  local hx gx; hx=$(host_xcode_build || true); gx=$(guest_xcode_build || true)
+  if [ -z "$gx" ]; then check "guest Xcode" 1 "not installed"
+  elif is_beta_xcode "$gx"; then check "guest Xcode is a release" 1 "$gx is a beta"
+  elif [ -n "$(xcode_drift "$hx" "$gx")" ]; then check "guest Xcode is current" 1 "host $hx, guest $gx"
+  else check "guest Xcode" 0 "$gx${hx:+ (this Mac: $hx)}"; fi
+  local ids; ids=$(guest_identity_hashes | wc -l | tr -d ' ')
+  [ "$ids" -ge 1 ] && check "valid signing identities" 0 "$ids" || check "valid signing identities" 1 "none (provision imports the distribution p12)"
+  if [ -n "$MAC_INSTALLER_P12" ]; then
+    gssh "security find-identity -v login.keychain-db | grep -q 'Installer'" && check "Mac installer identity" 0 || check "Mac installer identity" 0 "imported on the first macOS build"
+  fi
+  if [ -n "$ASC_KEY_ID" ]; then
+    gssh "test -f ~/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8" && check "ASC API key in guest" 0 || check "ASC API key in guest" 1 "run 'buildvm provision'"
+  fi
+  local free; free=$(guest_free_gb || echo 0)
+  [ "${free:-0}" -ge "$MIN_FREE_GB" ] && check "guest disk" 0 "${free} GB free" || check "guest disk" 1 "${free} GB free, floor $MIN_FREE_GB (buildvm clean)"
+  if [ -d "$LOCK_DIR" ]; then
+    local owner; owner=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then check "build lock" 0 "held by pid $owner ($(cat "$LOCK_DIR/what" 2>/dev/null))"
+    else check "build lock" 1 "stale (pid ${owner:-?} is gone) — the next build clears it"; fi
+  else check "build lock" 0 "free"; fi
+  if [ "$DOCTOR_FAILS" = 0 ]; then echo "doctor: all clear"; else echo "doctor: $DOCTOR_FAILS problem(s)"; return 1; fi
+}
+
+# ---- provisioning ---------------------------------------------------------------
 install_key() {
   local ip=$1 pub; pub=$(cat "$SSH_PUBKEY")
   local remote="mkdir -p ~/.ssh && chmod 700 ~/.ssh && printf '%s\n' '$pub' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
@@ -151,6 +364,7 @@ EOF
 cmd_provision() {
   need TART; need DIST_P12; need ASC_KEY_ID; need ASC_KEY_P8
   [ -f "$SSH_PUBKEY" ] || die "no SSH public key at $SSH_PUBKEY (set BUILDVM_SSH_PUBKEY)"
+  acquire_lock provision
   vm_ip >/dev/null 2>&1 || { nohup "$TART" run "$VM" --no-graphics >/tmp/buildvm-run.log 2>&1 & }
   local ip
   for _ in $(seq 1 90); do ip=$(vm_ip) && [ -n "$ip" ] && break; sleep 2; done
@@ -210,18 +424,209 @@ cmd_snapshot() {
   echo "snapshot: $name"
 }
 
+# ---- guest disk -----------------------------------------------------------------
+### Build output that is never needed again once an upload lands: archives, exports, the
+### verification unzip, per-build logs and the profile copies scp'd across. Nothing here can be
+### the input of a later build, so it is always safe to remove.
+GUEST_SCRATCH='rm -rf /tmp/*.xcarchive /tmp/export-* /tmp/vfy-* /tmp/buildvm-*.log /tmp/ExportOptions*.plist /tmp/*.mobileprovision /tmp/*.provisionprofile'
+
+### Reclaim guest disk in escalating stages until `free` GB are available, never touching `keep`
+### (the project being built). 1: scratch + the legacy shared DerivedData; 2: persistent
+### DerivedData, least recently built first; 3: synced project trees untouched for 14 days.
+prune_guest() {
+  local keep=$1 target=$2 free
+  echo "== pruning guest scratch"
+  gssh "$GUEST_SCRATCH; rm -rf ~/Library/Developer/Xcode/DerivedData/*" >/dev/null 2>&1 || true
+  free=$(guest_free_gb); [ "${free:-0}" -ge "$target" ] && return 0
+  local dir
+  for dir in $(gssh 'ls -tr ~/dd 2>/dev/null' 2>/dev/null); do
+    case $dir in "$keep"-*) continue;; esac
+    echo "   removing DerivedData $dir"
+    gssh "rm -rf ~/dd/'$dir'" >/dev/null 2>&1 || true
+    free=$(guest_free_gb); [ "${free:-0}" -ge "$target" ] && return 0
+  done
+  echo "   removing project trees untouched for 14 days"
+  gssh "find ~/builds -maxdepth 1 -mindepth 1 -mtime +14 ! -name '$keep' -exec rm -rf {} +" >/dev/null 2>&1 || true
+  return 0
+}
+
+ensure_disk() {
+  local keep=$1 free; free=$(guest_free_gb)
+  [ "${free:-0}" -ge "$MIN_FREE_GB" ] && return 0
+  echo "== guest disk low (${free:-?} GB free, floor $MIN_FREE_GB)"
+  prune_guest "$keep" "$MIN_FREE_GB"
+  free=$(guest_free_gb)
+  [ "${free:-0}" -ge "$HARD_MIN_FREE_GB" ] ||
+    die "guest has only ${free:-?} GB free after pruning (need $HARD_MIN_FREE_GB) — grow the disk with 'tart set $VM --disk-size'"
+  echo "   ${free} GB free"
+}
+
+cmd_clean() {
+  local all=0 days=14
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --all) all=1; shift;;
+      --days) days=$2; shift 2;;
+      *) die "unknown clean arg: $1";;
+    esac
+  done
+  acquire_lock clean
+  cmd_up >/dev/null
+  local before after; before=$(guest_free_gb)
+  gssh "$GUEST_SCRATCH; rm -rf ~/Library/Developer/Xcode/DerivedData/*" >/dev/null 2>&1 || true
+  if [ "$all" = 1 ]; then
+    gssh 'rm -rf ~/dd/* ~/builds/*' >/dev/null 2>&1 || true
+  else
+    gssh "find ~/dd ~/builds -maxdepth 1 -mindepth 1 -mtime +$days -exec rm -rf {} +" >/dev/null 2>&1 || true
+  fi
+  after=$(guest_free_gb)
+  echo "guest disk: ${before:-?} GB → ${after:-?} GB free"
+}
+
+cmd_history() {
+  local n=${1:-15}
+  [ -f "$LEDGER" ] || { echo "(no builds recorded yet)"; return 0; }
+  printf 'when\tname\tplatform\tmarketing\tbuild\tsha\toutcome\tdelivery\tseconds\n'
+  tail -n "$n" "$LEDGER"
+}
+
+# ---- preflight --------------------------------------------------------------------
+plist_get() { printf '%s' "$1" | plutil -extract "$2" raw -o - - 2>/dev/null; }
+
+### Everything knowable about a profile on this side of the VM: it must not be expired, must be an
+### App Store profile (a development or ad-hoc one lists devices), and should match the platform.
+### Each of these otherwise surfaces only after the archive, ten minutes in.
+check_profile() { # file platform
+  local plist; plist=$(security cms -D -i "$1" 2>/dev/null) || die "cannot read profile $1"
+  check_profile_plist "$plist" "$2"
+}
+
+check_profile_plist() { # decoded-plist platform
+  local plist=$1 platform=$2 exp left_days name token expected
+  name=$(plist_get "$plist" Name)
+  exp=$(plist_get "$plist" ExpirationDate)
+  if [ -n "$exp" ]; then
+    left_days=$(( ( $(date -j -u -f %Y-%m-%dT%H:%M:%SZ "$exp" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+    [ "$left_days" -ge 0 ] || die "profile '$name' expired on $exp"
+    [ "$left_days" -ge 14 ] || warn "profile '$name' expires in $left_days days ($exp)"
+  fi
+  printf '%s' "$plist" | plutil -extract ProvisionedDevices raw -o - - >/dev/null 2>&1 &&
+    die "profile '$name' lists devices — it is a development/ad-hoc profile, not an App Store one"
+  case $platform in
+    ios) expected=iOS;; tvos) expected=tvOS;; visionos) expected="xrOS|visionOS|iOS";; macos) expected=OSX;;
+  esac
+  local i=0 found=0
+  while token=$(plist_get "$plist" "Platform.$i"); do
+    [[ "$token" =~ ^($expected)$ ]] && found=1
+    i=$((i + 1))
+  done
+  [ "$found" = 1 ] || warn "profile '$name' does not list a $platform platform"
+  return 0
+}
+
+### SHA-1 fingerprints (upper-case hex) of the certificates a profile was minted for.
+profile_cert_hashes() {
+  local plist=$1 i=0 b64
+  while b64=$(plist_get "$plist" "DeveloperCertificates.$i"); do
+    printf '%s' "$b64" | base64 -D | shasum -a 1 | cut -d' ' -f1 | tr 'a-f' 'A-F'
+    i=$((i + 1))
+  done
+}
+
+### The guest must hold the private key of a certificate the profile includes, or the export dies
+### with "no signing certificate" after the archive has already been built.
+check_profile_cert() { # file hashes-of-guest-identities
+  local plist; plist=$(security cms -D -i "$1" 2>/dev/null) || die "cannot read profile $1"
+  check_profile_cert_plist "$plist" "$2"
+}
+
+check_profile_cert_plist() { # decoded-plist hashes-of-guest-identities
+  local plist=$1 guest=$2 h name
+  name=$(plist_get "$plist" Name)
+  for h in $(profile_cert_hashes "$plist"); do
+    printf '%s\n' "$guest" | grep -qx "$h" && return 0
+  done
+  die "profile '$name' was minted for certificates the guest does not hold — import the matching p12 or re-mint the profile"
+}
+
+### Refuses a tree that is behind its upstream (the near-miss where a build made from a stale
+### checkout would have shipped without nine commits of shipped work) and says so when the tree
+### has uncommitted changes. Detached worktrees have no upstream and are skipped.
+git_preflight() { # dir allow_stale
+  local dir=$1 allow_stale=$2
+  RUN_SHA=""
+  git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  RUN_SHA=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)
+  local dirty; dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$dirty" -gt 0 ]; then
+    warn "$dir has $dirty uncommitted change(s); the build includes them"
+    RUN_SHA="$RUN_SHA+dirty"
+  fi
+  git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 || return 0
+  GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=8' \
+    git -C "$dir" fetch -q 2>/dev/null || warn "could not fetch $dir's upstream; staleness not checked"
+  local behind; behind=$(git -C "$dir" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+  if [ "$behind" -gt 0 ] && [ "$allow_stale" != 1 ]; then
+    die "$dir is $behind commit(s) behind its upstream — pull first (or pass --allow-stale)"
+  fi
+  return 0
+}
+
+# ---- project file -----------------------------------------------------------------
+PROJECT_NAME=""; PROJECT_EXCLUDES=(); TARGET_NAMES=(); TARGET_ARGS=()
+
+### Reads DIR/.buildvm: `name`, `exclude` and `target` lines (see the header). Missing is fine.
+load_project_file() {
+  PROJECT_NAME=""; PROJECT_EXCLUDES=(); TARGET_NAMES=(); TARGET_ARGS=()
+  local file=$1/.buildvm line key rest tname targs
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%%#*}
+    line=${line#"${line%%[![:space:]]*}"}
+    [ -n "$line" ] || continue
+    key=${line%%[[:space:]]*}
+    rest=${line#"$key"}; rest=${rest#"${rest%%[![:space:]]*}"}; rest=${rest%"${rest##*[![:space:]]}"}
+    case $key in
+      name) PROJECT_NAME=$rest;;
+      exclude) PROJECT_EXCLUDES+=("$rest");;
+      target)
+        tname=${rest%%[[:space:]]*}
+        targs=${rest#"$tname"}
+        [ -n "$tname" ] && [ -n "$targs" ] || die "$file: 'target' needs a name and arguments"
+        TARGET_NAMES+=("$tname"); TARGET_ARGS+=("$targs");;
+      *) die "$file: unknown directive '$key'";;
+    esac
+  done < "$file"
+}
+
+# ---- build ------------------------------------------------------------------------
+### Copies a guest log home so a failure can be read in full rather than as its last 25 lines.
+fetch_guest_log() { # guest-path label
+  mkdir -p "$LOG_DIR"
+  local dest="$LOG_DIR/$RUN_NAME-$RUN_PLATFORM-$RUN_BUILD-$2.log"
+  if gscp "$GUEST_USER@$(vm_ip):$1" "$dest" >/dev/null 2>&1; then echo "full log: $dest"; fi
+}
+
+### The compile/sign errors from a log, so a failed build says why without anyone opening it.
+error_digest() { # guest-path
+  gssh "grep -E 'error:|ARCHIVE FAILED|EXPORT FAILED|requires a provisioning profile|No signing certificate|No profile' '$1' | sort -u | head -15" 2>/dev/null || true
+}
+
 cmd_build() {
-  local dir="" scheme="" marketing="" build_number="" platform="ios"
+  local dir="" scheme="" marketing="" build_number="" platform="ios" name_arg=""
   local prebuild="" deploy_key="" upload=1 archive_flags="" unsigned_archive=0
-  local -a profiles=() components=() envs=()
+  local clean=0 keep_artifacts=0 allow_stale=0 force=0 preflight=1 stop_after=0
+  local -a profiles=() components=() envs=() excludes=()
   while [ $# -gt 0 ]; do
     case $1 in
       --dir) dir=$2; shift 2;;
+      --name) name_arg=$2; shift 2;;
       --scheme) scheme=$2; shift 2;;
       --platform) platform=$2; shift 2;;
       --profile) profiles+=("$2"); shift 2;;
       --component) components+=("$2"); shift 2;;
       --env) envs+=("$2"); shift 2;;
+      --exclude) excludes+=("$2"); shift 2;;
       --marketing) marketing=$2; shift 2;;
       --build) build_number=$2; shift 2;;
       --prebuild) prebuild=$2; shift 2;;
@@ -230,10 +635,17 @@ cmd_build() {
       --unsigned-archive) unsigned_archive=1; shift;;
       --upload) upload=1; shift;;
       --no-upload) upload=0; shift;;
+      --clean) clean=1; shift;;
+      --keep-artifacts) keep_artifacts=1; shift;;
+      --allow-stale) allow_stale=1; shift;;
+      --force) force=1; shift;;
+      --no-preflight) preflight=0; shift;;
+      --down) stop_after=1; shift;;
       *) die "unknown build arg: $1";;
     esac
   done
   [ -d "$dir" ] || die "no such --dir: $dir"
+  dir=$(cd "$dir" && pwd)
   [ -n "$scheme" ] && [ -n "$build_number" ] || die "need --scheme --build"
   [ ${#profiles[@]} -gt 0 ] || die "need at least one --profile"
   local dest artifact_ext pext atype dlplatform
@@ -243,11 +655,33 @@ cmd_build() {
   need TEAM_ID
   [ "$upload" = 1 ] && { need ASC_KEY_ID; need ASC_ISSUER_ID; }
 
+  load_project_file "$dir"
+  local name=${name_arg:-${PROJECT_NAME:-$(derive_name "$dir")}}
+  [ -n "$name" ] || die "could not work out a project name for $dir (pass --name)"
+  [ ${#PROJECT_EXCLUDES[@]} -gt 0 ] && excludes+=("${PROJECT_EXCLUDES[@]}")
+
+  RUN_CTX=1; RUN_START=$SECONDS; RUN_NAME=$name; RUN_PLATFORM=$platform
+  RUN_MARKETING=$marketing; RUN_BUILD=$build_number; RUN_OUTCOME=built
+  trap on_exit EXIT
+  acquire_lock "$name $platform $build_number"
+  RUN_START=$SECONDS
+
+  phase preflight "preflight $name ($platform) build $build_number${marketing:+ marketing $marketing}"
+  git_preflight "$dir" "$allow_stale"
+  if [ "$upload" = 1 ] && [ "$force" != 1 ]; then
+    ledger_has_upload "$name" "$platform" "$marketing" "$build_number" &&
+      die "build $build_number of $name/$platform${marketing:+ ($marketing)} was already uploaded — use a higher number (or --force)"
+    local top; top=$(ledger_max_build "$name" "$platform" "$marketing")
+    [ -n "$top" ] && [ "$build_number" -lt "$top" ] 2>/dev/null &&
+      warn "build $build_number is lower than $top, already uploaded for this version"
+  fi
+
   # Resolve each profile to an absolute path and derive (bundle-id, name) from its entitlements.
   local -a pfiles=() pmap=()
   local p pf appid bid pname
   for p in "${profiles[@]}"; do
     pf=$(resolve_profile "$p")
+    [ "$preflight" = 1 ] && check_profile "$pf" "$platform"
     appid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract Entitlements.application-identifier raw -o - - 2>/dev/null) ||
       appid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract 'Entitlements.com\.apple\.application-identifier' raw -o - -)
     bid=${appid#*.}                                        # strip TEAMID. prefix
@@ -256,10 +690,19 @@ cmd_build() {
   done
 
   local ip; ip=$(cmd_up)
-  local name; name=$(basename "$dir")
   local guest_build; guest_build=$(gssh 'sw_vers -buildVersion')
   is_beta_build "$guest_build" && die "guest macOS $guest_build is BETA — would trip ITMS-90111"
   echo "== guest build $guest_build (stable)"
+  local hx gx; hx=$(host_xcode_build || true); gx=$(guest_xcode_build || true)
+  [ -z "$(xcode_drift "$hx" "$gx")" ] || warn "$(xcode_drift "$hx" "$gx")"
+  ! is_beta_xcode "$gx" || die "the guest's Xcode $gx is a beta — App Store uploads need a release Xcode"
+
+  if [ "$preflight" = 1 ]; then
+    local guest_ids; guest_ids=$(guest_identity_hashes)
+    [ -n "$guest_ids" ] || die "the guest holds no valid signing identity — run 'buildvm provision'"
+    for pf in "${pfiles[@]}"; do check_profile_cert "$pf" "$guest_ids"; done
+  fi
+  ensure_disk "$name"
 
   [ -n "$dlplatform" ] && ensure_platform "$dlplatform"
 
@@ -271,17 +714,21 @@ cmd_build() {
 
   if [ -n "$deploy_key" ]; then
     echo "== installing SPM deploy key"
+    deploy_key=$(resolve_profile "$deploy_key")
     gscp "$deploy_key" "$GUEST_USER@$ip:/tmp/spm_key"
     gssh 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && mv /tmp/spm_key ~/.ssh/spm_key && chmod 600 ~/.ssh/spm_key &&
           printf "Host github.com\n  IdentityFile ~/.ssh/spm_key\n  IdentitiesOnly yes\n" > ~/.ssh/config &&
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null'
   fi
 
-  echo "== syncing $name → guest"
-  gssh 'mkdir -p ~/builds'
-  rsync -a --delete --exclude .git --exclude DerivedData --exclude build --exclude .build \
-    --exclude '*.xcuserstate' \
+  phase sync "syncing $name → guest"
+  gssh 'mkdir -p ~/builds ~/dd'
+  local -a rsync_excludes=(--exclude .git --exclude DerivedData --exclude build --exclude .build --exclude '*.xcuserstate')
+  local ex
+  for ex in ${excludes[@]+"${excludes[@]}"}; do rsync_excludes+=(--exclude "$ex"); done
+  rsync -a --delete --delete-excluded "${rsync_excludes[@]}" \
     -e "ssh ${SSH_OPTS[*]}" "$dir/" "$GUEST_USER@$ip:builds/$name/"
+  gssh "touch ~/builds/'$name'"
 
   if [ -n "$prebuild" ]; then
     echo "== prebuild"
@@ -295,7 +742,7 @@ cmd_build() {
     local uuid; uuid=$(security cms -D -i "$pf" 2>/dev/null | plutil -extract UUID raw -o - -)
     gscp "$pf" "$GUEST_USER@$ip:/tmp/$uuid.$pext"
     gssh "cp /tmp/$uuid.$pext ~/Library/Developer/Xcode/UserData/Provisioning\\ Profiles/ &&
-          cp /tmp/$uuid.$pext ~/Library/MobileDevice/Provisioning\\ Profiles/"
+          cp /tmp/$uuid.$pext ~/Library/MobileDevice/Provisioning\\ Profiles/ && rm -f /tmp/$uuid.$pext"
   done
 
   if [ "$platform" = macos ]; then
@@ -327,16 +774,33 @@ cmd_build() {
   # the sole signer and entitlements must come entirely from the profile.
   local sign_arg="" sign_label="signed by project"
   [ "$unsigned_archive" = 1 ] && { sign_arg="CODE_SIGNING_ALLOWED=NO"; sign_label="unsigned"; }
-  echo "== archiving build $build_number ${marketing:+marketing $marketing} ($sign_label, $platform)"
+
+  # One DerivedData per app and platform, kept between builds: the second build of an app is
+  # incremental and Swift packages are not re-resolved. A caller's own -derivedDataPath wins.
+  local key="$name-$platform" dd_arg=""
+  case " $archive_flags " in
+    *" -derivedDataPath "*) ;;
+    *) dd_arg="-derivedDataPath \$HOME/dd/$key";;
+  esac
+  [ "$clean" = 1 ] && gssh "rm -rf ~/dd/'$key'"
+  gssh "mkdir -p ~/dd/'$key' && touch ~/dd/'$key'"
+
+  local archive="/tmp/$key.xcarchive" exportdir="/tmp/export-$key" vfy="/tmp/vfy-$key"
+  local glog="/tmp/buildvm-$key.log" plist="/tmp/ExportOptions-$key.plist"
+
+  phase archive "archiving build $build_number ${marketing:+marketing $marketing} ($sign_label, $platform)"
   # pipefail + rm of any prior archive: without both, a failed xcodebuild exits 0 through
   # `tail` and the previous run's stale archive gets re-exported and re-uploaded.
-  gssh "set -o pipefail && export PATH=/usr/local/bin:\$PATH && ${env_prefix}security unlock-keychain -p $GUEST_PASS login.keychain-db && cd builds/$name &&
+  gssh "export PATH=/usr/local/bin:\$PATH && ${env_prefix}security unlock-keychain -p $GUEST_PASS login.keychain-db && cd builds/$name &&
         if [ -f project.yml ]; then xcodegen generate >/dev/null; fi &&
-        rm -rf /tmp/$name.xcarchive &&
-        xcodebuild -scheme '$scheme' -configuration Release -destination '$dest' \
-          -archivePath /tmp/$name.xcarchive CURRENT_PROJECT_VERSION=$build_number $mv_arg $archive_flags \
-          $sign_arg archive 2>&1 | tail -25 && test -d /tmp/$name.xcarchive" ||
+        rm -rf $archive $glog &&
+        xcodebuild -scheme '$scheme' -configuration Release -destination '$dest' $dd_arg \
+          -archivePath $archive CURRENT_PROJECT_VERSION=$build_number $mv_arg $archive_flags \
+          $sign_arg archive > $glog 2>&1; rc=\$?; if [ \$rc -eq 0 ]; then grep -E '^\*\* |Signing Identity:|Provisioning Profile:' $glog | sort -u | tail -6; else tail -10 $glog 2>/dev/null; fi; [ \$rc -eq 0 ] && test -d $archive" || {
+    error_digest "$glog"
+    fetch_guest_log "$glog" archive
     die "archive FAILED for build $build_number (xcodebuild output above)"
+  }
 
   local pp_dict="" entry
   for entry in "${pmap[@]}"; do
@@ -345,9 +809,9 @@ cmd_build() {
 
   local installer_key=""
   [ "$platform" = macos ] && installer_key="<key>installerSigningCertificate</key><string>$MAC_INSTALLER_IDENTITY</string>"
-  local artifact_glob="/tmp/export-$name/*.$artifact_ext"
-  echo "== exporting (re-sign app + extensions)"
-  gssh "cat > /tmp/ExportOptions.plist <<PLIST
+  local artifact_glob="$exportdir/*.$artifact_ext"
+  phase export "exporting (re-sign app + extensions)"
+  gssh "cat > $plist <<PLIST
 <?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
 <plist version=\"1.0\"><dict>
@@ -363,56 +827,146 @@ $installer_key
 </dict></plist>
 PLIST
         security unlock-keychain -p $GUEST_PASS login.keychain-db &&
-        rm -rf /tmp/export-$name && xcodebuild -exportArchive -archivePath /tmp/$name.xcarchive \
-          -exportPath /tmp/export-$name -exportOptionsPlist /tmp/ExportOptions.plist 2>&1 | tail -2 &&
-        ls $artifact_glob"
+        rm -rf $exportdir && xcodebuild -exportArchive -archivePath $archive \
+          -exportPath $exportdir -exportOptionsPlist $plist > $glog-export 2>&1; rc=\$?; tail -2 $glog-export; [ \$rc -eq 0 ] &&
+        ls $artifact_glob" || {
+    error_digest "$glog-export"
+    fetch_guest_log "$glog-export" export
+    die "export FAILED for build $build_number (xcodebuild output above)"
+  }
 
-  echo "== verifying BuildMachineOSBuild is stable"
+  phase verify "verifying BuildMachineOSBuild is stable"
   local bmob
   if [ "$platform" = macos ]; then
-    bmob=$(gssh "cd /tmp && rm -rf vfy-$name && pkgutil --expand-full /tmp/export-$name/*.pkg /tmp/vfy-$name &&
-                 pl=\$(find /tmp/vfy-$name -path '*.app/Contents/Info.plist' | head -1) && /usr/libexec/PlistBuddy -c 'Print BuildMachineOSBuild' \"\$pl\"")
+    bmob=$(gssh "cd /tmp && rm -rf $vfy && pkgutil --expand-full $exportdir/*.pkg $vfy &&
+                 pl=\$(find $vfy -path '*.app/Contents/Info.plist' | head -1) && /usr/libexec/PlistBuddy -c 'Print BuildMachineOSBuild' \"\$pl\"")
   else
-    bmob=$(gssh "cd /tmp && rm -rf vfy-$name && mkdir vfy-$name && cd vfy-$name && unzip -q /tmp/export-$name/*.ipa && /usr/libexec/PlistBuddy -c 'Print BuildMachineOSBuild' Payload/*.app/Info.plist")
+    bmob=$(gssh "cd /tmp && rm -rf $vfy && mkdir $vfy && cd $vfy && unzip -q $exportdir/*.ipa && /usr/libexec/PlistBuddy -c 'Print BuildMachineOSBuild' Payload/*.app/Info.plist")
   fi
+  RUN_BMOB=$bmob
   echo "BuildMachineOSBuild=$bmob"
   is_beta_build "$bmob" && die "artifact stamped with beta build $bmob — DO NOT UPLOAD"
 
   # Catch any other stale-artifact path: the exported binary must carry the requested build number.
   local artifact_cfbv
   if [ "$platform" = macos ]; then
-    artifact_cfbv=$(gssh "pl=\$(find /tmp/vfy-$name -path '*.app/Contents/Info.plist' | head -1) && /usr/libexec/PlistBuddy -c 'Print CFBundleVersion' \"\$pl\"")
+    artifact_cfbv=$(gssh "pl=\$(find $vfy -path '*.app/Contents/Info.plist' | head -1) && /usr/libexec/PlistBuddy -c 'Print CFBundleVersion' \"\$pl\"")
   else
-    artifact_cfbv=$(gssh "/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' /tmp/vfy-$name/Payload/*.app/Info.plist")
+    artifact_cfbv=$(gssh "/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' $vfy/Payload/*.app/Info.plist")
   fi
   [ "$artifact_cfbv" = "$build_number" ] ||
     die "artifact CFBundleVersion=$artifact_cfbv != requested --build $build_number — stale archive, refusing to upload"
 
   if [ "$upload" = 1 ]; then
-    echo "== uploading to App Store Connect"
-    local out
-    if out=$(gssh "xcrun altool --upload-app -f $artifact_glob -t $atype --apiKey $ASC_KEY_ID --apiIssuer $ASC_ISSUER_ID 2>&1"); then
-      echo "$out" | tail -6
-      echo "== done: build $build_number ✔"
-    else
-      echo "$out" | tail -20
-      die "altool upload FAILED for build $build_number (exit above) — nothing was delivered to App Store Connect"
-    fi
+    phase upload "uploading to App Store Connect"
+    upload_artifact "$artifact_glob" "$atype" "$build_number"
+    RUN_OUTCOME=uploaded
+    echo "== done: build $build_number ✔"
+    [ "$keep_artifacts" = 1 ] || gssh "rm -rf $archive $exportdir $vfy $glog $glog-export $plist" >/dev/null 2>&1 || true
   else
-    echo "== built (no upload). Artifact in guest: /tmp/export-$name/"
+    echo "== built (no upload). Artifact in guest: $exportdir/"
   fi
+  [ "$stop_after" = 1 ] && cmd_down
+  return 0
 }
 
-cmd=${1:-status}; shift || true
-case $cmd in
-  up) cmd_up ;;
-  down) cmd_down ;;
-  ip) vm_ip ;;
-  ssh) gssh "$@" ;;
-  status) cmd_status ;;
-  provision) cmd_provision ;;
-  snapshot) cmd_snapshot "$@" ;;
-  build) cmd_build "$@" ;;
-  -h|--help|help) sed -n '3,49p' "$0" | sed 's/^### \{0,1\}//' ;;
-  *) die "unknown command: $cmd (try: up down ip ssh status provision snapshot build help)" ;;
-esac
+### Whether altool's output describes a failure a retry can fix (network, timeouts, a 5xx from
+### Apple) as opposed to one it cannot (a rejected build number, a bad binary).
+upload_error_is_transient() {
+  printf '%s' "$1" | grep -Eiq 'timed out|timeout|connection (reset|lost|was)|network|temporarily|try again|unreachable|(http|status|error)[^0-9]{0,12}50[0-9]|NSURLErrorDomain|Could not (connect|resolve)'
+}
+
+### altool, retried on the failures a retry can fix (network, timeouts, a 5xx from Apple) and
+### never on the ones it cannot (a rejected build number, a bad binary). Sets RUN_DELIVERY.
+upload_artifact() { # glob atype build
+  local glob=$1 atype=$2 build=$3 out attempt=1
+  while :; do
+    if out=$(gssh "xcrun altool --upload-app -f $glob -t $atype --apiKey $ASC_KEY_ID --apiIssuer $ASC_ISSUER_ID 2>&1"); then
+      echo "$out" | tail -6
+      RUN_DELIVERY=$(printf '%s\n' "$out" | sed -n 's/.*Delivery UUID: //p' | tail -1)
+      return 0
+    fi
+    echo "$out" | tail -20
+    if [ "$attempt" -lt "$UPLOAD_ATTEMPTS" ] && upload_error_is_transient "$out"; then
+      warn "upload attempt $attempt failed with what looks like a transient error — retrying in $((attempt * 20))s"
+      sleep $((attempt * 20)); attempt=$((attempt + 1)); continue
+    fi
+    die "altool upload FAILED for build $build (exit above) — nothing was delivered to App Store Connect"
+  done
+}
+
+### Builds every target of DIR/.buildvm in order, one VM boot, one lock. A failed target stops
+### the run unless --keep-going; the exit status is non-zero if any target failed.
+cmd_ship() {
+  local dir="." build_number="" marketing="" only="" keep_going=0 upload_flag="" down=0
+  local -a passthrough=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dir) dir=$2; shift 2;;
+      --build) build_number=$2; shift 2;;
+      --marketing) marketing=$2; shift 2;;
+      --only) only=$2; shift 2;;
+      --keep-going) keep_going=1; shift;;
+      --no-upload) upload_flag=--no-upload; shift;;
+      --down) down=1; shift;;
+      --clean|--allow-stale|--force|--no-preflight|--keep-artifacts) passthrough+=("$1"); shift;;
+      *) die "unknown ship arg: $1";;
+    esac
+  done
+  [ -n "$build_number" ] || die "ship needs --build N"
+  [ -f "$dir/.buildvm" ] || die "no $dir/.buildvm — describe the targets there (see buildvm help)"
+  load_project_file "$dir"
+  [ ${#TARGET_NAMES[@]} -gt 0 ] || die "$dir/.buildvm has no 'target' lines"
+
+  local -a names=("${TARGET_NAMES[@]}") argsets=("${TARGET_ARGS[@]}")
+  if [ -n "$only" ]; then
+    local want; for want in $(printf '%s' "$only" | tr ',' ' '); do
+      local seen=0 n; for n in "${names[@]}"; do [ "$n" = "$want" ] && seen=1; done
+      [ "$seen" = 1 ] || die "no target '$want' in $dir/.buildvm (have: ${names[*]})"
+    done
+  fi
+
+  acquire_lock "ship $(basename "$(cd "$dir" && pwd)") $build_number"
+  trap on_exit EXIT
+  local i n rc=0 summary="" status
+  for i in "${!names[@]}"; do
+    n=${names[$i]}
+    if [ -n "$only" ] && ! printf ',%s,' "$only" | grep -q ",$n,"; then continue; fi
+    echo; echo "######## ship: $n ########"
+    local -a args
+    eval "args=(${argsets[$i]})"
+    set +e
+    ( LOCK_OWNER=0; BUILDVM_LOCK_HELD=1; cmd_build --dir "$dir" ${marketing:+--marketing "$marketing"} --build "$build_number" \
+        ${upload_flag:+"$upload_flag"} ${passthrough[@]+"${passthrough[@]}"} "${args[@]}" )
+    status=$?
+    set -e
+    if [ "$status" = 0 ]; then summary="$summary $n ✔"; else summary="$summary $n ✖"; rc=1; [ "$keep_going" = 1 ] || break; fi
+  done
+  echo; echo "ship summary:$summary"
+  [ "$down" = 1 ] && cmd_down
+  return "$rc"
+}
+
+main() {
+  trap on_exit EXIT
+  local cmd=${1:-status}; shift || true
+  case $cmd in
+    up) cmd_up ;;
+    down) cmd_down ;;
+    ip) vm_ip ;;
+    ssh) gssh "$@" ;;
+    status) cmd_status "$@" ;;
+    doctor) cmd_doctor ;;
+    provision) cmd_provision ;;
+    snapshot) cmd_snapshot "$@" ;;
+    build) cmd_build "$@" ;;
+    ship) cmd_ship "$@" ;;
+    clean) cmd_clean "$@" ;;
+    history) cmd_history "$@" ;;
+    -V|--version|version) echo "buildvm $BUILDVM_VERSION" ;;
+    -h|--help|help) awk 'NR >= 4 { if ($0 ~ /^###/) { sub(/^### ?/, ""); print } else exit }' "$0" ;;
+    *) die "unknown command: $cmd (try: up down ip ssh status doctor provision snapshot build ship clean history help)" ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi
