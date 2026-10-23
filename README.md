@@ -39,8 +39,8 @@ git clone https://github.com/guitaripod/buildvm && cd buildvm
 ln -s "$PWD/bin/buildvm" ~/.local/bin/buildvm     # or add bin/ to PATH
 cp config.example.env ~/.config/buildvm/config.env && $EDITOR ~/.config/buildvm/config.env
 
-tart clone ghcr.io/cirruslabs/macos-tahoe-base:latest buildvm
-tart set buildvm --cpu 8 --memory 24576 --disk-size 120
+tart clone ghcr.io/cirruslabs/macos-golden-gate-xcode:27.1 buildvm
+tart set buildvm --cpu 8 --memory 16384
 buildvm provision        # Xcode + iOS platform + signing identity, all over SSH
 buildvm snapshot         # reusable base
 

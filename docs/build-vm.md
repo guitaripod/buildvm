@@ -26,9 +26,9 @@ needed during the next beta season.
 # Tart (installed from GitHub release, not brew — brew refuses on the Xcode/OS mismatch)
 curl -L .../tart.tar.gz | tar xz -C /Applications && ln -s /Applications/tart.app/Contents/MacOS/tart ~/.local/bin/tart
 
-tart clone ghcr.io/cirruslabs/macos-tahoe-base:latest buildvm   # stable macOS 26.5 (25F71)
-tart set buildvm --cpu 8 --memory 24576 --disk-size 120
-buildvm provision        # SSH key, copy host Xcode.app, download iOS platform, import signing
+tart clone ghcr.io/cirruslabs/macos-golden-gate-xcode:27.1 buildvm   # stable macOS 27.0 (26A428), release Xcode 27.1
+tart set buildvm --cpu 8 --memory 16384
+buildvm provision        # SSH key, the image's release Xcode (or a copy of the host's), iOS platform, signing
 buildvm snapshot         # → buildvm-provisioned  (reusable CoW base)
 ```
 
@@ -121,8 +121,11 @@ Verify entitlements survived before uploading:
 - **Snapshot to recover fast.** `buildvm-provisioned` is a CoW clone of the fully-set-up
   guest; if `buildvm` gets into a bad state, `tart delete buildvm && tart clone
   buildvm-provisioned buildvm`. Re-snapshot from a cleanly *stopped* VM for a pristine base.
-- **Guest = macOS 26.5 (25F71), Xcode 26.6.** The guest OS need not match the host; only
-  its stability matters. Xcode version doesn't trigger ITMS-90111 — only the host-OS build.
+- **Guest = macOS 27.0 (26A428), Xcode 27.1 (27A9275), since 2026-10-23.** The guest runs the current
+  stable major macOS with a release Xcode, so it is ready the day the host takes the next major beta
+  and builds the newest SDK (Duo-adapted builds need 27.1). When a new major macOS ships stable,
+  recreate it from the cirruslabs `macos-<name>-xcode:<version>` image of that release before the next
+  beta season; a Tart guest cannot update itself. Only the host-OS build triggers ITMS-90111.
 - Vault paths: signing in `<signing-dir>/`, ASC key id/issuer in
   `~/.config/buildvm/config.env` (`ASC_KEY_ID`, `ASC_ISSUER_ID`).
 
